@@ -3,6 +3,8 @@ build/
 dist/
 Resources/AppIcon.icns
 Resources/AppIcon.iconset/
+.netbar-github-deploy-key
+.netbar-github-deploy-key.pub
 *.dmg
 *.app/
 *.xcarchive/
