@@ -34,6 +34,18 @@ struct DeviceGuess {
     }
 }
 
+struct PingResult {
+    var ip: String
+    var averageMS: Double?
+    var receivedCount: Int
+    var didTimeout: Bool
+    var error: String?
+
+    var isBad: Bool {
+        didTimeout || receivedCount == 0 || averageMS == nil
+    }
+}
+
 enum DeviceClassifier {
     static func classify(device: Device, name: String) -> DeviceGuess {
         let text = "\(name) \(device.hostname ?? "") \(device.mac)".lowercased()
@@ -1179,6 +1191,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         submenu.addItem(.separator())
 
+        let pingIP = NSMenuItem(title: "Ping IP (6 avg)", action: #selector(pingDevice(_:)), keyEquivalent: "")
+        pingIP.target = self
+        pingIP.representedObject = device.id
+        submenu.addItem(pingIP)
+
         let copyIP = NSMenuItem(title: "Copy IP", action: #selector(copyIP(_:)), keyEquivalent: "")
         copyIP.target = self
         copyIP.representedObject = device.id
@@ -1321,6 +1338,124 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let deviceID = sender.representedObject as? String,
               let device = devicesByID[deviceID] else { return }
         copyToPasteboard(device.mac)
+    }
+
+    @objc private func pingDevice(_ sender: NSMenuItem) {
+        guard let deviceID = sender.representedObject as? String,
+              let device = devicesByID[deviceID] else { return }
+
+        let label = displayName(for: device)
+        let ip = device.ip
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = self?.runPing(ip: ip) ?? PingResult(
+                ip: ip,
+                averageMS: nil,
+                receivedCount: 0,
+                didTimeout: true,
+                error: "NetBar could not start the ping check."
+            )
+            DispatchQueue.main.async {
+                self?.showPingResult(result, label: label)
+            }
+        }
+    }
+
+    private func runPing(ip: String) -> PingResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/sbin/ping")
+        process.arguments = ["-c", "6", "-W", "1000", ip]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        let semaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            semaphore.signal()
+        }
+
+        do {
+            try process.run()
+        } catch {
+            return PingResult(
+                ip: ip,
+                averageMS: nil,
+                receivedCount: 0,
+                didTimeout: false,
+                error: error.localizedDescription
+            )
+        }
+
+        let didTimeout = semaphore.wait(timeout: .now() + 6) == .timedOut
+        if didTimeout {
+            process.terminate()
+            Thread.sleep(forTimeInterval: 0.15)
+            if process.isRunning {
+                process.interrupt()
+            }
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return PingResult(
+            ip: ip,
+            averageMS: parsePingAverage(from: output),
+            receivedCount: parseReceivedPingCount(from: output),
+            didTimeout: didTimeout,
+            error: nil
+        )
+    }
+
+    private func parsePingAverage(from output: String) -> Double? {
+        for line in output.split(separator: "\n") {
+            guard line.contains("="), line.contains("/") else { continue }
+            let parts = line.components(separatedBy: "=")
+            guard parts.count > 1 else { continue }
+            let values = parts[1]
+                .replacingOccurrences(of: "ms", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(separator: "/")
+            if values.count >= 2 {
+                return Double(values[1])
+            }
+        }
+        return nil
+    }
+
+    private func parseReceivedPingCount(from output: String) -> Int {
+        for line in output.split(separator: "\n") where line.contains("packets received") {
+            let pieces = line.split(separator: ",")
+            guard pieces.count >= 2 else { continue }
+            let receivedText = pieces[1].trimmingCharacters(in: .whitespaces)
+            if let first = receivedText.split(separator: " ").first,
+               let count = Int(first) {
+                return count
+            }
+        }
+        return 0
+    }
+
+    private func showPingResult(_ result: PingResult, label: String) {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        if result.isBad {
+            alert.alertStyle = .warning
+            alert.messageText = "Bad ping"
+            alert.informativeText = "\(label) at \(result.ip) did not reply within 6 seconds."
+        } else {
+            alert.alertStyle = .informational
+            alert.messageText = "Ping average"
+            let average = String(format: "%.1f", result.averageMS ?? 0)
+            alert.informativeText = "\(label) at \(result.ip)\nAverage: \(average) ms across \(result.receivedCount)/6 replies."
+        }
+
+        if let error = result.error {
+            alert.informativeText += "\n\n\(error)"
+        }
+
+        alert.addButton(withTitle: "Done")
+        alert.runModal()
     }
 
     private func copyToPasteboard(_ value: String) {

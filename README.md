@@ -17,6 +17,7 @@ Designed by Simon Stevens.
 - Guessed device categories, such as router, mobile, games console, computer, TV, printer, or smart-home kit.
 - A visual Network Map with the router, this Mac, and discovered devices.
 - New devices are highlighted in both the Menu Bar list and Network Map for a few minutes after they appear.
+- A per-device Ping IP action sends 6 pings and reports the average, or marks it as a bad ping if no reply arrives within 6 seconds.
 
 ## Important Limits
 
