@@ -69,7 +69,9 @@ On refresh, NetBar briefly probes the private/local IPv4 subnet for this Mac's a
 
 ## Device Location Layer
 
-NetBar starts the Device Location Layer from launch and refreshes it with the normal background scan. Open `Device Location Layer` from the Menu Bar menu to see the radar-style confidence view.
+NetBar starts the Device Location Layer from launch and refreshes it with the normal background scan. Open `Device Radar...` from the Menu Bar menu to see the radar-style confidence view.
+
+The radar shows the router as the fixed network anchor and uses the same device-type colours/icons as the Network Map. Select a radar dot to expand its IP, confidence zone, category, and MAC address when `Show MAC addresses` is enabled.
 
 The layer stores snapshots locally in:
 

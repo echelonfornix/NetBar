@@ -1125,8 +1125,11 @@ struct DeviceLocationRadarNode {
     var title: String
     var detail: String
     var zone: String
+    var ip: String?
+    var mac: String?
     var confidence: Int
     var category: String
+    var icon: String
     var accent: NSColor
     var angle: CGFloat
     var radius: CGFloat
@@ -1144,6 +1147,9 @@ final class DeviceLocationLayer {
         var hostname: String?
         var rssi: Int?
         var inferredClass: String
+        var displayType: String
+        var icon: String
+        var accent: NSColor
         var confidenceHint: String
     }
 
@@ -1196,6 +1202,7 @@ final class DeviceLocationLayer {
         let snapshotID = Int(now.timeIntervalSince1970 * 1000)
         let wifi = wifiInfo()
         var observations = networkObservations(from: devices, routerIP: routerIP)
+        addRouterObservationIfNeeded(to: &observations, routerIP: routerIP)
         observations.append(contentsOf: bluetoothObservations())
 
         let currentIDs = Set(observations.map(\.id))
@@ -1217,6 +1224,7 @@ final class DeviceLocationLayer {
             observations: observations,
             appeared: appeared,
             disappeared: disappeared,
+            routerIP: routerIP,
             snapshotID: snapshotID,
             date: now
         )
@@ -1332,24 +1340,49 @@ final class DeviceLocationLayer {
     }
 
     private func networkObservations(from devices: [Device], routerIP: String?) -> [Observation] {
-        devices.compactMap { device in
+        let normalizedRouterIP = routerIP?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return devices.compactMap { device in
             let saved = savedClassification(for: device.id)
             guard !saved.ignored else { return nil }
-            let name = device.hostname?.isEmpty == false ? device.hostname! : "Device \(lastOctet(of: device.ip))"
+            let isRouter = device.ip == normalizedRouterIP
+            let name = device.hostname?.isEmpty == false ? device.hostname! : (isRouter ? "Router / Gateway" : "Device \(lastOctet(of: device.ip))")
             let guess = DeviceClassifier.classify(device: device, name: name)
-            let inferred = saved.classification ?? inferredClass(from: guess.label, ip: device.ip, routerIP: routerIP)
+            let inferred = saved.classification ?? inferredClass(from: guess.label, ip: device.ip, routerIP: normalizedRouterIP)
             return Observation(
                 id: device.id,
                 name: name,
-                source: "arp",
+                source: isRouter ? "router" : "arp",
                 ip: device.ip,
                 mac: device.mac,
                 hostname: device.hostname,
                 rssi: nil,
                 inferredClass: inferred,
+                displayType: isRouter ? "Router" : guess.label,
+                icon: isRouter ? "📡" : guess.icon,
+                accent: isRouter ? .systemBlue : guess.accent,
                 confidenceHint: guess.confidence
             )
         }
+    }
+
+    private func addRouterObservationIfNeeded(to observations: inout [Observation], routerIP: String?) {
+        guard let routerIP, !observations.contains(where: { $0.ip == routerIP || $0.source == "router" }) else { return }
+        observations.append(
+            Observation(
+                id: "router:\(routerIP)",
+                name: "Router / Gateway",
+                source: "router",
+                ip: routerIP,
+                mac: nil,
+                hostname: nil,
+                rssi: nil,
+                inferredClass: "static",
+                displayType: "Router",
+                icon: "📡",
+                accent: .systemBlue,
+                confidenceHint: "medium"
+            )
+        )
     }
 
     private func savedClassification(for id: String) -> (classification: String?, ignored: Bool) {
@@ -1395,6 +1428,9 @@ final class DeviceLocationLayer {
                         hostname: nil,
                         rssi: rssiValue,
                         inferredClass: inferredBluetoothClass(from: name),
+                        displayType: "Bluetooth",
+                        icon: "📱",
+                        accent: .systemPurple,
                         confidenceHint: rssiValue == nil ? "low" : "medium"
                     )
                 )
@@ -1474,7 +1510,7 @@ final class DeviceLocationLayer {
                 last_seen = excluded.last_seen,
                 observation_count = observation_count + 1;
             INSERT INTO observations (snapshot_id, device_id, source, present, ip, mac, hostname, rssi, ping_present)
-            VALUES (\(id), \(sqlValue(observation.id)), \(sqlValue(observation.source)), 1, \(sqlValue(observation.ip)), \(sqlValue(observation.mac)), \(sqlValue(observation.hostname)), \(sqlValue(observation.rssi)), \(observation.source == "arp" ? 1 : 0));
+            VALUES (\(id), \(sqlValue(observation.id)), \(sqlValue(observation.source)), 1, \(sqlValue(observation.ip)), \(sqlValue(observation.mac)), \(sqlValue(observation.hostname)), \(sqlValue(observation.rssi)), \(observation.source == "arp" || observation.source == "router" ? 1 : 0));
             """
         }
 
@@ -1482,7 +1518,7 @@ final class DeviceLocationLayer {
         sqliteExec(sql)
     }
 
-    private func updateState(observations: [Observation], appeared: Set<String>, disappeared: Set<String>, snapshotID: Int, date: Date) {
+    private func updateState(observations: [Observation], appeared: Set<String>, disappeared: Set<String>, routerIP: String?, snapshotID: Int, date: Date) {
         let totalSnapshots = max(1, Int(sqliteOutput("SELECT COUNT(*) FROM snapshots;").trimmingCharacters(in: .whitespacesAndNewlines)) ?? 1)
         var lines: [String] = []
         var mobileCount = 0
@@ -1490,6 +1526,7 @@ final class DeviceLocationLayer {
         var leftBehind: [String] = []
         var nodes: [DeviceLocationRadarNode] = []
         let disappearedMobileCount = disappeared.count
+        let normalizedRouterIP = routerIP?.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let now = dateFormatter.string(from: date)
         var scoreSQL = "BEGIN TRANSACTION;"
@@ -1504,8 +1541,13 @@ final class DeviceLocationLayer {
             let cluster = clusterScore(for: observation, appeared: appeared)
             let leftBehindScore = leftBehindScore(for: observation, disappearedMobileCount: disappearedMobileCount)
             let confidence = min(96, max(20, (presence * 0.25) + (stability * 0.25) + (nearMac * 0.2) + ((100 - novelty) * 0.15) + (cluster * 0.15)))
-            let zone = zoneLabel(for: observation)
-            let state = "\(observation.name): \(zone), \(observation.inferredClass), confidence \(Int(confidence.rounded()))%"
+            let isRouterObservation = observation.source == "router" || observation.ip == normalizedRouterIP
+            let nodeTitle = isRouterObservation ? "Router / Gateway" : observation.name
+            let nodeCategory = isRouterObservation ? "Router" : observation.displayType
+            let nodeIcon = isRouterObservation ? "📡" : observation.icon
+            let nodeAccent: NSColor = isRouterObservation ? .systemBlue : observation.accent
+            let zone = isRouterObservation ? "Near router" : zoneLabel(for: observation)
+            let state = "\(nodeTitle): \(zone), \(nodeCategory), confidence \(Int(confidence.rounded()))%"
             let isLeftBehind = leftBehindScore >= 60
 
             if observation.inferredClass == "mobile" || observation.inferredClass == "semi-static" {
@@ -1515,20 +1557,23 @@ final class DeviceLocationLayer {
                 unknownCount += 1
             }
             if isLeftBehind {
-                leftBehind.append("\(observation.name) may be left behind")
+                leftBehind.append("\(nodeTitle) may be left behind")
             }
             lines.append(state)
             nodes.append(
                 DeviceLocationRadarNode(
                     id: observation.id,
-                    title: observation.name,
+                    title: nodeTitle,
                     detail: state,
                     zone: zone,
+                    ip: observation.ip,
+                    mac: observation.mac,
                     confidence: Int(confidence.rounded()),
-                    category: observation.inferredClass,
-                    accent: accent(for: observation.inferredClass, source: observation.source),
+                    category: nodeCategory,
+                    icon: nodeIcon,
+                    accent: nodeAccent,
                     angle: angle(for: observation.id),
-                    radius: radius(for: observation),
+                    radius: isRouterObservation ? 0.92 : radius(for: observation),
                     isLeftBehind: isLeftBehind,
                     isNew: appeared.contains(observation.id)
                 )
@@ -1627,6 +1672,9 @@ final class DeviceLocationLayer {
     }
 
     private func zoneLabel(for observation: Observation) -> String {
+        if observation.source == "router" {
+            return "Near router"
+        }
         if observation.source == "bluetooth" {
             return "Bluetooth nearby"
         }
@@ -1660,6 +1708,9 @@ final class DeviceLocationLayer {
     }
 
     private func radius(for observation: Observation) -> CGFloat {
+        if observation.source == "router" {
+            return 0.92
+        }
         if observation.source == "bluetooth" {
             return 0.36
         }
@@ -1753,9 +1804,12 @@ final class DeviceLocationRadarView: NSView {
     var lastSnapshotText = "never"
     var recentChanges: [String] = []
     var leftBehindAlerts: [String] = []
+    var showMacAddresses = false
 
+    private var selectedNodeID: String?
     private var sweepAngle: CGFloat = 0
     private var animationTimer: Timer?
+    private var hitRects: [String: NSRect] = [:]
 
     override var isFlipped: Bool {
         true
@@ -1775,54 +1829,80 @@ final class DeviceLocationRadarView: NSView {
         }
     }
 
-    func updateFromLayer(_ layer: DeviceLocationLayer, formattedSnapshot: String) {
+    func updateFromLayer(_ layer: DeviceLocationLayer, formattedSnapshot: String, showMacAddresses: Bool) {
         nodes = layer.radarNodes
         statusText = layer.statusText
         summaryText = "\(layer.knownPresentCount) present - \(layer.mobilePresentCount) mobile - \(layer.unknownPresentCount) unknown"
         lastSnapshotText = formattedSnapshot
-        recentChanges = Array(layer.recentChangeLines.prefix(4))
-        leftBehindAlerts = Array(layer.leftBehindAlerts.prefix(4))
+        recentChanges = Array(layer.recentChangeLines.prefix(3))
+        leftBehindAlerts = Array(layer.leftBehindAlerts.prefix(3))
+        self.showMacAddresses = showMacAddresses
+
+        if let selectedNodeID, nodes.contains(where: { $0.id == selectedNodeID }) {
+            self.selectedNodeID = selectedNodeID
+        } else {
+            self.selectedNodeID = nodes.first(where: { $0.category == "Router" })?.id ?? nodes.first?.id
+        }
         needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        if let match = hitRects.first(where: { $0.value.contains(location) }) {
+            selectedNodeID = match.key
+            needsDisplay = true
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {
         NSColor.windowBackgroundColor.setFill()
         bounds.fill()
 
-        let leftWidth = min(bounds.width * 0.58, bounds.width - 300)
-        let radarRect = NSRect(x: 28, y: 76, width: leftWidth - 44, height: bounds.height - 114)
-        let panelRect = NSRect(x: radarRect.maxX + 24, y: 76, width: bounds.maxX - radarRect.maxX - 52, height: bounds.height - 114)
+        let layout = currentLayout()
+        hitRects.removeAll()
 
         drawHeader()
-        drawRadar(in: radarRect)
-        drawStatePanel(in: panelRect)
+        drawRadar(in: layout.radar)
+        drawKey(in: layout.key)
+        drawSelectedInfo(in: layout.detail)
+    }
+
+    private func currentLayout() -> (radar: NSRect, key: NSRect, detail: NSRect) {
+        let padding: CGFloat = 28
+        let headerHeight: CGFloat = 76
+        let detailHeight: CGFloat = 154
+        let keyWidth: CGFloat = min(250, max(210, bounds.width * 0.25))
+        let detail = NSRect(x: padding, y: bounds.height - detailHeight - 20, width: bounds.width - padding * 2, height: detailHeight)
+        let key = NSRect(x: bounds.width - keyWidth - padding, y: headerHeight, width: keyWidth, height: detail.minY - headerHeight - 18)
+        let radar = NSRect(x: padding, y: headerHeight, width: key.minX - padding * 1.5, height: detail.minY - headerHeight - 18)
+        return (radar, key, detail)
     }
 
     private func drawHeader() {
-        drawText("Device Location Layer", in: NSRect(x: 28, y: 22, width: 360, height: 28), font: .systemFont(ofSize: 24, weight: .bold), color: .labelColor)
+        drawText("Device Radar", in: NSRect(x: 28, y: 22, width: 300, height: 28), font: .systemFont(ofSize: 24, weight: .bold), color: .labelColor)
         drawText("Status: \(statusText) - \(summaryText) - last snapshot \(lastSnapshotText)", in: NSRect(x: 30, y: 52, width: bounds.width - 60, height: 18), font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
     }
 
     private func drawRadar(in rect: NSRect) {
-        let size = min(rect.width, rect.height)
+        let size = max(240, min(rect.width, rect.height))
         let radarBounds = NSRect(x: rect.midX - size / 2, y: rect.midY - size / 2, width: size, height: size)
         let center = NSPoint(x: radarBounds.midX, y: radarBounds.midY)
-        let radius = size / 2 - 18
+        let radius = size / 2 - 22
 
         NSGraphicsContext.saveGraphicsState()
         let shadow = NSShadow()
-        shadow.shadowColor = NSColor.black.withAlphaComponent(0.16)
-        shadow.shadowBlurRadius = 14
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.14)
+        shadow.shadowBlurRadius = 12
         shadow.shadowOffset = NSSize(width: 0, height: -2)
         shadow.set()
         NSColor.controlBackgroundColor.setFill()
         NSBezierPath(ovalIn: radarBounds).fill()
         NSGraphicsContext.restoreGraphicsState()
 
-        NSColor.systemGreen.withAlphaComponent(0.09).setFill()
+        NSColor.systemGreen.withAlphaComponent(0.08).setFill()
         NSBezierPath(ovalIn: radarBounds.insetBy(dx: 10, dy: 10)).fill()
 
-        for fraction in [0.25, 0.5, 0.75, 1.0] {
+        for fraction in [0.33, 0.66, 1.0] {
             let ringRadius = radius * CGFloat(fraction)
             let ring = NSRect(x: center.x - ringRadius, y: center.y - ringRadius, width: ringRadius * 2, height: ringRadius * 2)
             NSColor.systemGreen.withAlphaComponent(0.18).setStroke()
@@ -1836,7 +1916,7 @@ final class DeviceLocationRadarView: NSView {
         drawZoneLabels(center: center, radius: radius)
         drawCenterMac(center: center)
 
-        for node in nodes.prefix(28) {
+        for node in nodes.prefix(40) {
             drawRadarNode(node, center: center, radius: radius)
         }
 
@@ -1851,7 +1931,7 @@ final class DeviceLocationRadarView: NSView {
         path.line(to: NSPoint(x: center.x + radius, y: center.y))
         path.move(to: NSPoint(x: center.x, y: center.y - radius))
         path.line(to: NSPoint(x: center.x, y: center.y + radius))
-        NSColor.systemGreen.withAlphaComponent(0.16).setStroke()
+        NSColor.systemGreen.withAlphaComponent(0.14).setStroke()
         path.lineWidth = 1
         path.stroke()
     }
@@ -1859,105 +1939,162 @@ final class DeviceLocationRadarView: NSView {
     private func drawSweep(center: NSPoint, radius: CGFloat) {
         let path = NSBezierPath()
         path.move(to: center)
-        path.appendArc(withCenter: center, radius: radius, startAngle: degrees(sweepAngle - 0.35), endAngle: degrees(sweepAngle), clockwise: false)
+        path.appendArc(withCenter: center, radius: radius, startAngle: degrees(sweepAngle - 0.32), endAngle: degrees(sweepAngle), clockwise: false)
         path.close()
-        NSColor.systemGreen.withAlphaComponent(0.20).setFill()
+        NSColor.systemGreen.withAlphaComponent(0.18).setFill()
         path.fill()
 
         let line = NSBezierPath()
         line.move(to: center)
         line.line(to: NSPoint(x: center.x + cos(sweepAngle) * radius, y: center.y + sin(sweepAngle) * radius))
-        NSColor.systemGreen.withAlphaComponent(0.75).setStroke()
+        NSColor.systemGreen.withAlphaComponent(0.7).setStroke()
         line.lineWidth = 2
         line.stroke()
     }
 
     private func drawZoneLabels(center: NSPoint, radius: CGFloat) {
-        drawText("Near Mac", in: NSRect(x: center.x - 46, y: center.y - radius * 0.34, width: 92, height: 18), font: .systemFont(ofSize: 11, weight: .medium), color: .secondaryLabelColor, alignment: .center)
-        drawText("Home network", in: NSRect(x: center.x - 56, y: center.y - radius * 0.74, width: 112, height: 18), font: .systemFont(ofSize: 11, weight: .medium), color: .secondaryLabelColor, alignment: .center)
-        drawText("Router / fixed edge", in: NSRect(x: center.x - 70, y: center.y + radius * 0.78, width: 140, height: 18), font: .systemFont(ofSize: 11, weight: .medium), color: .secondaryLabelColor, alignment: .center)
+        drawText("Near Mac", in: NSRect(x: center.x - 44, y: center.y - radius * 0.38, width: 88, height: 16), font: .systemFont(ofSize: 10, weight: .medium), color: .secondaryLabelColor, alignment: .center)
+        drawText("Home network", in: NSRect(x: center.x - 58, y: center.y - radius * 0.72, width: 116, height: 16), font: .systemFont(ofSize: 10, weight: .medium), color: .secondaryLabelColor, alignment: .center)
+        drawText("Router edge", in: NSRect(x: center.x - 50, y: center.y + radius * 0.78, width: 100, height: 16), font: .systemFont(ofSize: 10, weight: .medium), color: .secondaryLabelColor, alignment: .center)
     }
 
     private func drawCenterMac(center: NSPoint) {
-        let macRect = NSRect(x: center.x - 34, y: center.y - 34, width: 68, height: 68)
+        let macRect = NSRect(x: center.x - 31, y: center.y - 31, width: 62, height: 62)
         NSColor.systemGreen.withAlphaComponent(0.24).setFill()
         NSBezierPath(ovalIn: macRect).fill()
         NSColor.systemGreen.withAlphaComponent(0.85).setStroke()
         let path = NSBezierPath(ovalIn: macRect)
         path.lineWidth = 2
         path.stroke()
-        drawText("Mac", in: macRect.insetBy(dx: 6, dy: 24), font: .systemFont(ofSize: 13, weight: .bold), color: .labelColor, alignment: .center)
+        drawText("💻", in: macRect.insetBy(dx: 8, dy: 8), font: .systemFont(ofSize: 24), color: .labelColor, alignment: .center)
     }
 
     private func drawRadarNode(_ node: DeviceLocationRadarNode, center: NSPoint, radius: CGFloat) {
         let pointRadius = radius * node.radius
         let position = NSPoint(x: center.x + cos(node.angle) * pointRadius, y: center.y + sin(node.angle) * pointRadius)
-        let dotSize: CGFloat = node.isLeftBehind ? 16 : (node.isNew ? 14 : 11)
+        let isSelected = node.id == selectedNodeID
+        let dotSize: CGFloat = isSelected ? 32 : (node.isLeftBehind ? 28 : 24)
         let dotRect = NSRect(x: position.x - dotSize / 2, y: position.y - dotSize / 2, width: dotSize, height: dotSize)
+        hitRects[node.id] = dotRect.insetBy(dx: -8, dy: -8)
 
-        node.accent.withAlphaComponent(node.isLeftBehind ? 0.95 : 0.82).setFill()
-        NSBezierPath(ovalIn: dotRect).fill()
-        NSColor.controlBackgroundColor.withAlphaComponent(0.9).setStroke()
-        let outline = NSBezierPath(ovalIn: dotRect)
-        outline.lineWidth = node.isLeftBehind ? 2.4 : 1.5
-        outline.stroke()
-
-        if node.isLeftBehind {
-            drawText("!", in: dotRect.insetBy(dx: 2, dy: 0), font: .systemFont(ofSize: 11, weight: .bold), color: .white, alignment: .center)
+        if isSelected {
+            node.accent.withAlphaComponent(0.18).setFill()
+            NSBezierPath(ovalIn: dotRect.insetBy(dx: -7, dy: -7)).fill()
         }
 
-        let label = compactLabel(node.title)
-        drawText(label, in: NSRect(x: position.x - 48, y: position.y + dotSize / 2 + 4, width: 96, height: 16), font: .systemFont(ofSize: 10, weight: .medium), color: .secondaryLabelColor, alignment: .center)
+        node.accent.withAlphaComponent(node.isLeftBehind ? 0.96 : 0.86).setFill()
+        NSBezierPath(ovalIn: dotRect).fill()
+        NSColor.controlBackgroundColor.withAlphaComponent(0.92).setStroke()
+        let outline = NSBezierPath(ovalIn: dotRect)
+        outline.lineWidth = isSelected ? 2.6 : 1.5
+        outline.stroke()
+
+        drawText(node.isLeftBehind ? "!" : node.icon, in: dotRect.insetBy(dx: 3, dy: 3), font: .systemFont(ofSize: isSelected ? 16 : 13, weight: node.isLeftBehind ? .bold : .regular), color: .white, alignment: .center)
     }
 
-    private func drawStatePanel(in rect: NSRect) {
+    private func drawKey(in rect: NSRect) {
         let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
         NSColor.controlBackgroundColor.setFill()
         path.fill()
-        NSColor.separatorColor.withAlphaComponent(0.8).setStroke()
+        NSColor.separatorColor.withAlphaComponent(0.75).setStroke()
         path.lineWidth = 1
         path.stroke()
 
-        var y = rect.minY + 18
-        drawText("Likely State", in: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: 22), font: .systemFont(ofSize: 16, weight: .semibold), color: .labelColor)
+        var y = rect.minY + 16
+        drawText("Key", in: NSRect(x: rect.minX + 16, y: y, width: rect.width - 32, height: 22), font: .systemFont(ofSize: 16, weight: .semibold), color: .labelColor)
         y += 30
 
+        for item in legendItems() {
+            let count = nodes.filter { $0.category == item.title }.count
+            guard count > 0 || item.alwaysShow else { continue }
+            let marker = NSRect(x: rect.minX + 16, y: y + 2, width: 20, height: 20)
+            item.color.withAlphaComponent(0.86).setFill()
+            NSBezierPath(ovalIn: marker).fill()
+            drawText(item.icon, in: marker.insetBy(dx: 3, dy: 3), font: .systemFont(ofSize: 11), color: .white, alignment: .center)
+            drawText("\(item.title) \(count > 0 ? "(\(count))" : "")", in: NSRect(x: rect.minX + 44, y: y + 2, width: rect.width - 60, height: 18), font: .systemFont(ofSize: 12), color: .labelColor)
+            y += 27
+        }
+
+        y += 8
         if !leftBehindAlerts.isEmpty {
-            drawText("Possible Left Behind", in: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: 18), font: .systemFont(ofSize: 12, weight: .semibold), color: .systemOrange)
+            drawText("Alerts", in: NSRect(x: rect.minX + 16, y: y, width: rect.width - 32, height: 18), font: .systemFont(ofSize: 12, weight: .semibold), color: .systemOrange)
             y += 22
-            for alert in leftBehindAlerts {
-                y = drawWrapped(alert, x: rect.minX + 18, y: y, width: rect.width - 36, color: .labelColor)
+            for alert in leftBehindAlerts.prefix(2) {
+                y = drawWrapped(alert, x: rect.minX + 16, y: y, width: rect.width - 32, color: .labelColor, height: 32)
             }
-            y += 8
-        }
-
-        drawText("Recent Changes", in: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: 18), font: .systemFont(ofSize: 12, weight: .semibold), color: .secondaryLabelColor)
-        y += 22
-        for change in recentChanges.prefix(4) {
-            y = drawWrapped(change, x: rect.minX + 18, y: y, width: rect.width - 36, color: .labelColor)
-        }
-
-        y += 12
-        drawText("Devices", in: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: 18), font: .systemFont(ofSize: 12, weight: .semibold), color: .secondaryLabelColor)
-        y += 22
-        for node in nodes.prefix(10) {
-            let markerRect = NSRect(x: rect.minX + 18, y: y + 4, width: 8, height: 8)
-            node.accent.setFill()
-            NSBezierPath(ovalIn: markerRect).fill()
-            let text = "\(node.title) - \(node.zone), \(node.confidence)%"
-            y = drawWrapped(text, x: rect.minX + 34, y: y, width: rect.width - 52, color: node.isLeftBehind ? .systemOrange : .labelColor)
         }
     }
 
-    private func drawWrapped(_ text: String, x: CGFloat, y: CGFloat, width: CGFloat, color: NSColor) -> CGFloat {
-        let rect = NSRect(x: x, y: y, width: width, height: 34)
-        drawText(text, in: rect, font: .systemFont(ofSize: 12), color: color)
-        return y + 36
+    private func drawSelectedInfo(in rect: NSRect) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
+        NSColor.controlBackgroundColor.setFill()
+        path.fill()
+        NSColor.separatorColor.withAlphaComponent(0.75).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+
+        guard let node = selectedNode else {
+            drawText("Select a radar dot", in: rect.insetBy(dx: 18, dy: 18), font: .systemFont(ofSize: 15, weight: .medium), color: .secondaryLabelColor)
+            return
+        }
+
+        let iconRect = NSRect(x: rect.minX + 18, y: rect.minY + 19, width: 42, height: 42)
+        node.accent.withAlphaComponent(0.9).setFill()
+        NSBezierPath(ovalIn: iconRect).fill()
+        drawText(node.icon, in: iconRect.insetBy(dx: 6, dy: 7), font: .systemFont(ofSize: 19), color: .white, alignment: .center)
+
+        drawText(node.title, in: NSRect(x: rect.minX + 74, y: rect.minY + 15, width: rect.width * 0.36, height: 24), font: .systemFont(ofSize: 17, weight: .semibold), color: .labelColor)
+        drawText("\(node.category) - \(node.zone) - confidence \(node.confidence)%", in: NSRect(x: rect.minX + 74, y: rect.minY + 42, width: rect.width * 0.42, height: 18), font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
+
+        let ipText = node.ip ?? "No IP observed"
+        let macText = showMacAddresses ? (node.mac ?? "No MAC observed") : "Hidden - enable Show MAC addresses"
+        drawText("IP: \(ipText)", in: NSRect(x: rect.minX + 74, y: rect.minY + 72, width: rect.width * 0.38, height: 18), font: .monospacedSystemFont(ofSize: 12, weight: .regular), color: .labelColor)
+        drawText("MAC: \(macText)", in: NSRect(x: rect.minX + 74, y: rect.minY + 96, width: rect.width * 0.48, height: 18), font: .monospacedSystemFont(ofSize: 12, weight: .regular), color: .secondaryLabelColor)
+
+        let rightX = rect.midX + 38
+        drawText("Recent", in: NSRect(x: rightX, y: rect.minY + 17, width: rect.maxX - rightX - 18, height: 18), font: .systemFont(ofSize: 12, weight: .semibold), color: .secondaryLabelColor)
+        var y = rect.minY + 41
+        for change in recentChanges.prefix(3) {
+            y = drawWrapped(change, x: rightX, y: y, width: rect.maxX - rightX - 18, color: .labelColor, height: 26)
+        }
+        if node.isNew {
+            drawText("New in the current baseline window", in: NSRect(x: rightX, y: rect.maxY - 32, width: rect.maxX - rightX - 18, height: 18), font: .systemFont(ofSize: 12, weight: .medium), color: node.accent)
+        } else if node.isLeftBehind {
+            drawText("Possible left-behind device", in: NSRect(x: rightX, y: rect.maxY - 32, width: rect.maxX - rightX - 18, height: 18), font: .systemFont(ofSize: 12, weight: .medium), color: .systemOrange)
+        }
     }
 
-    private func drawText(_ text: String, in rect: NSRect, font: NSFont, color: NSColor, alignment: NSTextAlignment = .left) {
+    private var selectedNode: DeviceLocationRadarNode? {
+        if let selectedNodeID, let match = nodes.first(where: { $0.id == selectedNodeID }) {
+            return match
+        }
+        return nodes.first(where: { $0.category == "Router" }) ?? nodes.first
+    }
+
+    private func legendItems() -> [(title: String, icon: String, color: NSColor, alwaysShow: Bool)] {
+        [
+            ("Router", "📡", .systemBlue, true),
+            ("Mobile", "📱", .systemIndigo, true),
+            ("Mobile or laptop", "📱", .systemIndigo, false),
+            ("Computer", "💻", .systemGreen, true),
+            ("Games", "🎮", .systemPurple, true),
+            ("TV / Media", "📺", .systemRed, true),
+            ("Printer", "🖨", .systemOrange, true),
+            ("Smart Home", "🏠", .systemYellow, true),
+            ("Bluetooth", "📱", .systemPurple, true),
+            ("Unknown device", "🔹", .systemGray, true)
+        ]
+    }
+
+    private func drawWrapped(_ text: String, x: CGFloat, y: CGFloat, width: CGFloat, color: NSColor, height: CGFloat) -> CGFloat {
+        let rect = NSRect(x: x, y: y, width: width, height: height)
+        drawText(text, in: rect, font: .systemFont(ofSize: 12), color: color, lineBreak: .byWordWrapping)
+        return y + height + 4
+    }
+
+    private func drawText(_ text: String, in rect: NSRect, font: NSFont, color: NSColor, alignment: NSTextAlignment = .left, lineBreak: NSLineBreakMode = .byTruncatingTail) {
         let paragraph = NSMutableParagraphStyle()
-        paragraph.lineBreakMode = .byTruncatingTail
+        paragraph.lineBreakMode = lineBreak
         paragraph.alignment = alignment
         let attributes: [NSAttributedString.Key: Any] = [
             .font: font,
@@ -1967,24 +2104,17 @@ final class DeviceLocationRadarView: NSView {
         (text as NSString).draw(in: rect, withAttributes: attributes)
     }
 
-    private func compactLabel(_ value: String) -> String {
-        if value.count <= 14 {
-            return value
-        }
-        return String(value.prefix(13)) + "..."
-    }
-
     private func degrees(_ radians: CGFloat) -> CGFloat {
         radians * 180 / .pi
     }
 }
 
 final class DeviceLocationWindowController: NSWindowController {
-    private let radarView = DeviceLocationRadarView(frame: NSRect(x: 0, y: 0, width: 900, height: 620))
+    private let radarView = DeviceLocationRadarView(frame: NSRect(x: 0, y: 0, width: 980, height: 700))
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 900, height: 620),
+            contentRect: NSRect(x: 0, y: 0, width: 980, height: 700),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
@@ -2003,8 +2133,8 @@ final class DeviceLocationWindowController: NSWindowController {
         nil
     }
 
-    func update(layer: DeviceLocationLayer, formattedSnapshot: String) {
-        radarView.updateFromLayer(layer, formattedSnapshot: formattedSnapshot)
+    func update(layer: DeviceLocationLayer, formattedSnapshot: String, showMacAddresses: Bool) {
+        radarView.updateFromLayer(layer, formattedSnapshot: formattedSnapshot, showMacAddresses: showMacAddresses)
     }
 }
 
@@ -2347,6 +2477,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.setShowMacAddresses(!store.state.showMacAddresses)
         rebuildMenu()
         settingsWindowController?.syncControls()
+        updateDeviceLocationWindow()
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
@@ -2453,7 +2584,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateDeviceLocationWindow() {
         let snapshot = locationLayer.lastSnapshotAt.map { timeFormatter.string(from: $0) } ?? "never"
-        deviceLocationWindowController?.update(layer: locationLayer, formattedSnapshot: snapshot)
+        deviceLocationWindowController?.update(layer: locationLayer, formattedSnapshot: snapshot, showMacAddresses: store.state.showMacAddresses)
     }
 
     private func showTextPanel(title: String, message: String) {
