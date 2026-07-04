@@ -1,6 +1,8 @@
 .DS_Store
 build/
 dist/
+Resources/AppIcon.icns
+Resources/AppIcon.iconset/
 *.dmg
 *.app/
 *.xcarchive/
