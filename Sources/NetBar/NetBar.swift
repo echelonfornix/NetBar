@@ -1991,6 +1991,8 @@ final class DeviceLocationWindowController: NSWindowController {
         )
         window.title = "NetBar Device Location Layer"
         window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         window.center()
         radarView.autoresizingMask = [.width, .height]
         window.contentView = radarView
@@ -2158,6 +2160,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         networkMap.target = self
         menu.addItem(networkMap)
 
+        let radar = NSMenuItem(title: "Device Radar...", action: #selector(showDeviceRadar(_:)), keyEquivalent: "d")
+        radar.target = self
+        menu.addItem(radar)
+
         addLocationLayerItems(to: menu)
 
         let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refresh(_:)), keyEquivalent: "r")
@@ -2211,7 +2217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         snapshot.target = self
         menu.addItem(snapshot)
 
-        let state = NSMenuItem(title: "Show Device State...", action: #selector(showDeviceState(_:)), keyEquivalent: "")
+        let state = NSMenuItem(title: "Open Radar View...", action: #selector(showDeviceRadar(_:)), keyEquivalent: "")
         state.target = self
         menu.addItem(state)
 
@@ -2405,13 +2411,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh(nil)
     }
 
-    @objc private func showDeviceState(_ sender: NSMenuItem) {
+    @objc private func showDeviceRadar(_ sender: NSMenuItem) {
         NSApp.activate(ignoringOtherApps: true)
         if deviceLocationWindowController == nil {
             deviceLocationWindowController = DeviceLocationWindowController()
         }
         updateDeviceLocationWindow()
         deviceLocationWindowController?.showWindow(nil)
+        deviceLocationWindowController?.window?.makeKeyAndOrderFront(nil)
     }
 
     @objc private func showRecentChanges(_ sender: NSMenuItem) {
