@@ -73,6 +73,8 @@ NetBar starts the Device Location Layer from launch and refreshes it with the no
 
 The radar shows the router as the fixed network anchor and uses the same device-type colours/icons as the Network Map. Select a radar dot to expand its IP, confidence zone, category, and MAC address when `Show MAC addresses` is enabled.
 
+Use the pencil in the selected-device panel to save a friendly name. That name is shared with the Menu Bar list and Network Map.
+
 The layer stores snapshots locally in:
 
 ```text

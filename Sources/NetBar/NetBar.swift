@@ -1195,14 +1195,14 @@ final class DeviceLocationLayer {
         return "scanning"
     }
 
-    func recordSnapshot(devices: [Device], localInfo: LocalAddressInfo, routerIP: String?) {
+    func recordSnapshot(devices: [Device], localInfo: LocalAddressInfo, routerIP: String?, aliases: [String: String] = [:]) {
         guard !isPaused else { return }
 
         let now = Date()
         let snapshotID = Int(now.timeIntervalSince1970 * 1000)
         let wifi = wifiInfo()
-        var observations = networkObservations(from: devices, routerIP: routerIP)
-        addRouterObservationIfNeeded(to: &observations, routerIP: routerIP)
+        var observations = networkObservations(from: devices, routerIP: routerIP, aliases: aliases)
+        addRouterObservationIfNeeded(to: &observations, routerIP: routerIP, aliases: aliases)
         observations.append(contentsOf: bluetoothObservations())
 
         let currentIDs = Set(observations.map(\.id))
@@ -1339,13 +1339,15 @@ final class DeviceLocationLayer {
         """)
     }
 
-    private func networkObservations(from devices: [Device], routerIP: String?) -> [Observation] {
+    private func networkObservations(from devices: [Device], routerIP: String?, aliases: [String: String]) -> [Observation] {
         let normalizedRouterIP = routerIP?.trimmingCharacters(in: .whitespacesAndNewlines)
         return devices.compactMap { device in
             let saved = savedClassification(for: device.id)
             guard !saved.ignored else { return nil }
             let isRouter = device.ip == normalizedRouterIP
-            let name = device.hostname?.isEmpty == false ? device.hostname! : (isRouter ? "Router / Gateway" : "Device \(lastOctet(of: device.ip))")
+            let name = aliases[device.id]
+                ?? (device.hostname?.isEmpty == false ? device.hostname! : nil)
+                ?? (isRouter ? "Router / Gateway" : "Device \(lastOctet(of: device.ip))")
             let guess = DeviceClassifier.classify(device: device, name: name)
             let inferred = saved.classification ?? inferredClass(from: guess.label, ip: device.ip, routerIP: normalizedRouterIP)
             return Observation(
@@ -1365,12 +1367,13 @@ final class DeviceLocationLayer {
         }
     }
 
-    private func addRouterObservationIfNeeded(to observations: inout [Observation], routerIP: String?) {
+    private func addRouterObservationIfNeeded(to observations: inout [Observation], routerIP: String?, aliases: [String: String]) {
         guard let routerIP, !observations.contains(where: { $0.ip == routerIP || $0.source == "router" }) else { return }
+        let id = "router:\(routerIP)"
         observations.append(
             Observation(
-                id: "router:\(routerIP)",
-                name: "Router / Gateway",
+                id: id,
+                name: aliases[id] ?? "Router / Gateway",
                 source: "router",
                 ip: routerIP,
                 mac: nil,
@@ -1542,7 +1545,7 @@ final class DeviceLocationLayer {
             let leftBehindScore = leftBehindScore(for: observation, disappearedMobileCount: disappearedMobileCount)
             let confidence = min(96, max(20, (presence * 0.25) + (stability * 0.25) + (nearMac * 0.2) + ((100 - novelty) * 0.15) + (cluster * 0.15)))
             let isRouterObservation = observation.source == "router" || observation.ip == normalizedRouterIP
-            let nodeTitle = isRouterObservation ? "Router / Gateway" : observation.name
+            let nodeTitle = observation.name
             let nodeCategory = isRouterObservation ? "Router" : observation.displayType
             let nodeIcon = isRouterObservation ? "📡" : observation.icon
             let nodeAccent: NSColor = isRouterObservation ? .systemBlue : observation.accent
@@ -1805,11 +1808,13 @@ final class DeviceLocationRadarView: NSView {
     var recentChanges: [String] = []
     var leftBehindAlerts: [String] = []
     var showMacAddresses = false
+    var onRenameNode: ((DeviceLocationRadarNode) -> Void)?
 
     private var selectedNodeID: String?
     private var sweepAngle: CGFloat = 0
     private var animationTimer: Timer?
     private var hitRects: [String: NSRect] = [:]
+    private var renameButtonRect: NSRect?
 
     override var isFlipped: Bool {
         true
@@ -1848,6 +1853,10 @@ final class DeviceLocationRadarView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
+        if let renameButtonRect, renameButtonRect.contains(location), let selectedNode {
+            onRenameNode?(selectedNode)
+            return
+        }
         if let match = hitRects.first(where: { $0.value.contains(location) }) {
             selectedNodeID = match.key
             needsDisplay = true
@@ -1860,6 +1869,7 @@ final class DeviceLocationRadarView: NSView {
 
         let layout = currentLayout()
         hitRects.removeAll()
+        renameButtonRect = nil
 
         drawHeader()
         drawRadar(in: layout.radar)
@@ -2043,7 +2053,10 @@ final class DeviceLocationRadarView: NSView {
         NSBezierPath(ovalIn: iconRect).fill()
         drawText(node.icon, in: iconRect.insetBy(dx: 6, dy: 7), font: .systemFont(ofSize: 19), color: .white, alignment: .center)
 
-        drawText(node.title, in: NSRect(x: rect.minX + 74, y: rect.minY + 15, width: rect.width * 0.36, height: 24), font: .systemFont(ofSize: 17, weight: .semibold), color: .labelColor)
+        let editRect = NSRect(x: rect.minX + 74 + rect.width * 0.36 - 30, y: rect.minY + 14, width: 26, height: 24)
+        renameButtonRect = editRect
+        drawText(node.title, in: NSRect(x: rect.minX + 74, y: rect.minY + 15, width: rect.width * 0.36 - 36, height: 24), font: .systemFont(ofSize: 17, weight: .semibold), color: .labelColor)
+        drawPencilButton(in: editRect)
         drawText("\(node.category) - \(node.zone) - confidence \(node.confidence)%", in: NSRect(x: rect.minX + 74, y: rect.minY + 42, width: rect.width * 0.42, height: 18), font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
 
         let ipText = node.ip ?? "No IP observed"
@@ -2069,6 +2082,24 @@ final class DeviceLocationRadarView: NSView {
             return match
         }
         return nodes.first(where: { $0.category == "Router" }) ?? nodes.first
+    }
+
+    func renameNode(id: String, to name: String) {
+        guard let index = nodes.firstIndex(where: { $0.id == id }) else { return }
+        nodes[index].title = name
+        nodes[index].detail = "\(name): \(nodes[index].zone), \(nodes[index].category), confidence \(nodes[index].confidence)%"
+        selectedNodeID = id
+        needsDisplay = true
+    }
+
+    private func drawPencilButton(in rect: NSRect) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+        NSColor.controlAccentColor.withAlphaComponent(0.14).setFill()
+        path.fill()
+        NSColor.controlAccentColor.withAlphaComponent(0.45).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+        drawText("✎", in: rect.insetBy(dx: 4, dy: 2), font: .systemFont(ofSize: 14, weight: .semibold), color: .controlAccentColor, alignment: .center)
     }
 
     private func legendItems() -> [(title: String, icon: String, color: NSColor, alwaysShow: Bool)] {
@@ -2112,7 +2143,7 @@ final class DeviceLocationRadarView: NSView {
 final class DeviceLocationWindowController: NSWindowController {
     private let radarView = DeviceLocationRadarView(frame: NSRect(x: 0, y: 0, width: 980, height: 700))
 
-    init() {
+    init(onRename: @escaping (DeviceLocationRadarNode) -> Void) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 980, height: 700),
             styleMask: [.titled, .closable, .resizable],
@@ -2125,6 +2156,7 @@ final class DeviceLocationWindowController: NSWindowController {
         window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         window.center()
         radarView.autoresizingMask = [.width, .height]
+        radarView.onRenameNode = onRename
         window.contentView = radarView
         super.init(window: window)
     }
@@ -2135,6 +2167,10 @@ final class DeviceLocationWindowController: NSWindowController {
 
     func update(layer: DeviceLocationLayer, formattedSnapshot: String, showMacAddresses: Bool) {
         radarView.updateFromLayer(layer, formattedSnapshot: formattedSnapshot, showMacAddresses: showMacAddresses)
+    }
+
+    func renameNode(id: String, to name: String) {
+        radarView.renameNode(id: id, to: name)
     }
 }
 
@@ -2198,12 +2234,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let previousIDs = Set(previousDevices.keys)
         let scanner = self.scanner
         let locationLayer = self.locationLayer
+        let aliases = store.state.aliases
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let localInfo = scanner.localAddressInfo()
             let devices = scanner.scan(previousDevices: previousDevices, localInfo: localInfo, activeLookup: true)
             let routerIP = scanner.gatewayIPAddress(localInfo: localInfo)
-            locationLayer.recordSnapshot(devices: devices, localInfo: localInfo, routerIP: routerIP)
+            let locationDevices = devices.map { device -> Device in
+                var copy = device
+                if let alias = aliases[device.id], !alias.isEmpty {
+                    copy.hostname = alias
+                }
+                return copy
+            }
+            locationLayer.recordSnapshot(devices: locationDevices, localInfo: localInfo, routerIP: routerIP, aliases: aliases)
             let now = Date()
 
             DispatchQueue.main.async {
@@ -2545,7 +2589,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showDeviceRadar(_ sender: NSMenuItem) {
         NSApp.activate(ignoringOtherApps: true)
         if deviceLocationWindowController == nil {
-            deviceLocationWindowController = DeviceLocationWindowController()
+            deviceLocationWindowController = DeviceLocationWindowController(onRename: { [weak self] node in
+                self?.renameRadarDevice(node)
+            })
         }
         updateDeviceLocationWindow()
         deviceLocationWindowController?.showWindow(nil)
@@ -2585,6 +2631,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateDeviceLocationWindow() {
         let snapshot = locationLayer.lastSnapshotAt.map { timeFormatter.string(from: $0) } ?? "never"
         deviceLocationWindowController?.update(layer: locationLayer, formattedSnapshot: snapshot, showMacAddresses: store.state.showMacAddresses)
+    }
+
+    private func renameRadarDevice(_ node: DeviceLocationRadarNode) {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        input.stringValue = store.state.aliases[node.id] ?? node.title
+
+        let alert = NSAlert()
+        alert.messageText = "Rename \(node.title)"
+        alert.informativeText = "This saved name is used in the radar, menu list, and Network Map."
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            store.setAlias(name, for: node.id)
+            deviceLocationWindowController?.renameNode(id: node.id, to: name.isEmpty ? node.title : name)
+            rebuildMenu()
+            updateNetworkMap()
+            refresh(nil)
+        }
     }
 
     private func showTextPanel(title: String, message: String) {

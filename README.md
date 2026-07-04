@@ -21,6 +21,7 @@ Designed by Simon Stevens.
 - A per-device Ping IP action sends 6 pings and reports the average, or marks it as a bad ping if no reply arrives within 6 seconds.
 - A Device Location Layer that takes background snapshots, stores them in local SQLite, and shows a radar-style confidence view for likely presence, mobility, novelty, and possible left-behind devices.
 - The Device Radar includes the router anchor, a Network Map-matched key, and a selected-device details panel with IP and optional MAC address.
+- Device Radar details include a pencil rename action that saves the same friendly name used by the Menu Bar list and Network Map.
 
 ## Important Limits
 
