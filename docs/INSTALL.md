@@ -56,3 +56,7 @@ NetBar stores its LaunchAgent at:
 ```text
 ~/Library/LaunchAgents/local.netbar.status.login.plist
 ```
+
+## New Device Highlighting
+
+NetBar uses the first scan after launch as its baseline. Devices that appear after that are marked `NEW` in the Menu Bar list and highlighted on the Network Map for a few minutes.

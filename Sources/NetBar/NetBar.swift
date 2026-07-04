@@ -606,6 +606,7 @@ struct NetworkMapNode {
     var detail: String
     var icon: String
     var accent: NSColor
+    var isNew: Bool = false
 }
 
 final class NetworkMapView: NSView {
@@ -758,16 +759,24 @@ final class NetworkMapView: NSView {
         shadow.set()
 
         let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
-        NSColor.controlBackgroundColor.setFill()
+        if node.isNew {
+            node.accent.withAlphaComponent(0.08).setFill()
+        } else {
+            NSColor.controlBackgroundColor.setFill()
+        }
         path.fill()
         NSGraphicsContext.restoreGraphicsState()
 
         node.accent.withAlphaComponent(0.20).setFill()
         NSBezierPath(roundedRect: NSRect(x: rect.minX, y: rect.minY, width: 7, height: rect.height), xRadius: 4, yRadius: 4).fill()
 
-        NSColor.separatorColor.withAlphaComponent(0.8).setStroke()
-        path.lineWidth = 1
+        (node.isNew ? node.accent : NSColor.separatorColor).withAlphaComponent(node.isNew ? 0.95 : 0.8).setStroke()
+        path.lineWidth = node.isNew ? 2.2 : 1
         path.stroke()
+
+        if node.isNew {
+            drawNewBadge(in: rect, accent: node.accent)
+        }
 
         let badgeRect = NSRect(x: rect.minX + 20, y: rect.minY + 22, width: 42, height: 42)
         node.accent.withAlphaComponent(0.14).setFill()
@@ -782,9 +791,10 @@ final class NetworkMapView: NSView {
 
         let textX = rect.minX + 78
         let textWidth = rect.maxX - textX - 18
+        let titleWidth = node.isNew ? max(80, textWidth - 52) : textWidth
         drawText(
             node.title,
-            in: NSRect(x: textX, y: rect.minY + 16, width: textWidth, height: 20),
+            in: NSRect(x: textX, y: rect.minY + 16, width: titleWidth, height: 20),
             font: NSFont.systemFont(ofSize: 14, weight: .semibold),
             color: NSColor.labelColor
         )
@@ -799,6 +809,20 @@ final class NetworkMapView: NSView {
             in: NSRect(x: textX, y: rect.minY + 62, width: textWidth, height: 18),
             font: NSFont.systemFont(ofSize: 11),
             color: NSColor.tertiaryLabelColor
+        )
+    }
+
+    private func drawNewBadge(in rect: NSRect, accent: NSColor) {
+        let badgeRect = NSRect(x: rect.maxX - 54, y: rect.minY + 13, width: 39, height: 18)
+        let badgePath = NSBezierPath(roundedRect: badgeRect, xRadius: 9, yRadius: 9)
+        accent.setFill()
+        badgePath.fill()
+        drawText(
+            "NEW",
+            in: badgeRect.insetBy(dx: 5, dy: 2),
+            font: NSFont.systemFont(ofSize: 9, weight: .bold),
+            color: .white,
+            alignment: .center
         )
     }
 
@@ -858,7 +882,7 @@ final class NetworkMapWindowController: NSWindowController {
         nil
     }
 
-    func update(devices: [Device], localInfo: LocalAddressInfo, gatewayIP: String?, lastRefresh: Date?) {
+    func update(devices: [Device], localInfo: LocalAddressInfo, gatewayIP: String?, lastRefresh: Date?, newDeviceIDs: Set<String>) {
         let localIP = localInfo.ip
         let routerDevice = findRouter(in: devices, gatewayIP: gatewayIP, localIP: localIP)
         let routerIP = routerDevice?.ip ?? gatewayIP
@@ -889,10 +913,12 @@ final class NetworkMapWindowController: NSWindowController {
                     && device.ip != routerIP
                     && device.id != routerDevice?.id
             }
-            .map { node(for: $0, role: nil, forcedIcon: nil, accent: nil) }
+            .map { node(for: $0, role: nil, forcedIcon: nil, accent: nil, isNew: newDeviceIDs.contains($0.id)) }
 
         let refreshed = lastRefresh.map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) } ?? "never"
-        mapView.footerText = "\(mapView.deviceNodes.count) devices below this Mac - refreshed \(refreshed)"
+        let newCount = mapView.deviceNodes.filter(\.isNew).count
+        let newText = newCount > 0 ? " - \(newCount) new" : ""
+        mapView.footerText = "\(mapView.deviceNodes.count) devices below this Mac\(newText) - refreshed \(refreshed)"
         mapView.refreshLayout(width: window?.contentView?.bounds.width ?? 760)
     }
 
@@ -915,7 +941,7 @@ final class NetworkMapWindowController: NSWindowController {
         }
     }
 
-    private func node(for device: Device, role: String?, forcedIcon: String?, accent: NSColor?) -> NetworkMapNode {
+    private func node(for device: Device, role: String?, forcedIcon: String?, accent: NSColor?, isNew: Bool = false) -> NetworkMapNode {
         let name = displayName(for: device)
         let classification = DeviceClassifier.classify(device: device, name: name)
         let title: String
@@ -932,7 +958,8 @@ final class NetworkMapWindowController: NSWindowController {
             subtitle: device.ip,
             detail: role ?? mapDetail(for: classification),
             icon: forcedIcon ?? classification.icon,
-            accent: accent ?? classification.accent
+            accent: accent ?? classification.accent,
+            isNew: isNew
         )
     }
 
@@ -985,6 +1012,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var devices: [Device] = []
     private var localInfo = LocalAddressInfo(interfaceName: nil, ip: nil, assignment: "Unknown")
     private var lastRefresh: Date?
+    private var hasCompletedInitialScan = false
+    private var newDeviceHighlights: [String: Date] = [:]
     private var timer: Timer?
     private var startupError: String?
     private var sharingPicker: NSSharingServicePicker?
@@ -1017,9 +1046,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func refresh(_ sender: Any?) {
         localInfo = scanner.localAddressInfo()
+        let previousIDs = Set(devicesByID.keys)
         devices = scanner.scan(previousDevices: devicesByID)
+        let now = Date()
+
+        if hasCompletedInitialScan {
+            for device in devices where !previousIDs.contains(device.id) {
+                newDeviceHighlights[device.id] = now
+            }
+        } else {
+            hasCompletedInitialScan = true
+        }
+
         devicesByID = Dictionary(uniqueKeysWithValues: devices.map { ($0.id, $0) })
-        lastRefresh = Date()
+        pruneNewDeviceHighlights(now: now)
+        lastRefresh = now
         rebuildMenu()
         updateNetworkMap()
     }
@@ -1032,7 +1073,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(title)
 
         let refreshed = lastRefresh.map { timeFormatter.string(from: $0) } ?? "Never"
-        let summary = NSMenuItem(title: "\(devices.count) seen - refreshed \(refreshed)", action: nil, keyEquivalent: "")
+        let newCount = devices.filter { isNewDevice($0) }.count
+        let newSummary = newCount > 0 ? " - \(newCount) new" : ""
+        let summary = NSMenuItem(title: "\(devices.count) seen\(newSummary) - refreshed \(refreshed)", action: nil, keyEquivalent: "")
         summary.isEnabled = false
         menu.addItem(summary)
 
@@ -1100,9 +1143,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func menuItem(for device: Device) -> NSMenuItem {
         let label = displayName(for: device)
         let subtitle = store.state.showMacAddresses ? "\(device.ip) - \(device.mac)" : device.ip
-        let item = NSMenuItem(title: "\(label)  \(subtitle)", action: nil, keyEquivalent: "")
+        let isNew = isNewDevice(device)
+        let newPrefix = isNew ? "NEW  " : ""
+        let item = NSMenuItem(title: "\(newPrefix)\(label)  \(subtitle)", action: nil, keyEquivalent: "")
         let submenu = NSMenu()
 
+        if isNew {
+            addDisabled("Status: New connection detected", to: submenu)
+        }
         addDisabled("IP: \(device.ip)", to: submenu)
         addDisabled("Interface: \(device.interfaceName)", to: submenu)
         addDisabled("Address: \(device.addressStatus)", to: submenu)
@@ -1167,6 +1215,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return "This Mac: \(ip) on \(interfaceName) - \(localInfo.assignment)"
     }
 
+    private func isNewDevice(_ device: Device) -> Bool {
+        newDeviceHighlights[device.id] != nil
+    }
+
+    private func pruneNewDeviceHighlights(now: Date) {
+        let visibleIDs = Set(devices.map(\.id))
+        let highlightDuration: TimeInterval = 5 * 60
+        newDeviceHighlights = newDeviceHighlights.filter { entry in
+            visibleIDs.contains(entry.key) && now.timeIntervalSince(entry.value) <= highlightDuration
+        }
+    }
+
     @objc private func toggleShowMacAddresses(_ sender: NSMenuItem) {
         store.setShowMacAddresses(!store.state.showMacAddresses)
         rebuildMenu()
@@ -1218,7 +1278,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             devices: devices,
             localInfo: localInfo,
             gatewayIP: scanner.gatewayIPAddress(),
-            lastRefresh: lastRefresh
+            lastRefresh: lastRefresh,
+            newDeviceIDs: Set(newDeviceHighlights.keys)
         )
     }
 
