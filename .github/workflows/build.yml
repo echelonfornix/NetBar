@@ -1,0 +1,28 @@
+name: Build NetBar
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build app
+        run: ./scripts/build.sh
+
+      - name: Package DMG
+        run: ./scripts/package_dmg.sh
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetBar-dmg
+          path: dist/NetBar.dmg
