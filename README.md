@@ -117,6 +117,7 @@ See [docs/PRIVACY.md](docs/PRIVACY.md) for more detail.
 
 - [Install Guide](docs/INSTALL.md)
 - [Distribution and Signing](docs/DISTRIBUTION.md)
+- [GitHub Publishing](docs/GITHUB_PUBLISH.md)
 - [Privacy Notes](docs/PRIVACY.md)
 - [Contributing](CONTRIBUTING.md)
 
