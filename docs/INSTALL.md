@@ -75,6 +75,8 @@ The radar shows the router as the fixed network anchor and uses the same device-
 
 Use the pencil in the selected-device panel to save a friendly name. That name is shared with the Menu Bar list and Network Map.
 
+The radar view filters this Mac and broadcast addresses, then deduplicates repeated Bluetooth records so the view stays focused on real device dots.
+
 The layer stores snapshots locally in:
 
 ```text

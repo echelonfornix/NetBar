@@ -22,6 +22,7 @@ Designed by Simon Stevens.
 - A Device Location Layer that takes background snapshots, stores them in local SQLite, and shows a radar-style confidence view for likely presence, mobility, novelty, and possible left-behind devices.
 - The Device Radar includes the router anchor, a Network Map-matched key, and a selected-device details panel with IP and optional MAC address.
 - Device Radar details include a pencil rename action that saves the same friendly name used by the Menu Bar list and Network Map.
+- Device Radar filters this Mac and broadcast addresses, and deduplicates repeated Bluetooth records before drawing radar dots.
 
 ## Important Limits
 

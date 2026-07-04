@@ -1201,9 +1201,10 @@ final class DeviceLocationLayer {
         let now = Date()
         let snapshotID = Int(now.timeIntervalSince1970 * 1000)
         let wifi = wifiInfo()
-        var observations = networkObservations(from: devices, routerIP: routerIP, aliases: aliases)
+        var observations = networkObservations(from: devices, localInfo: localInfo, routerIP: routerIP, aliases: aliases)
         addRouterObservationIfNeeded(to: &observations, routerIP: routerIP, aliases: aliases)
         observations.append(contentsOf: bluetoothObservations())
+        observations = deduplicatedObservations(observations)
 
         let currentIDs = Set(observations.map(\.id))
         let appeared = hasSeenBaseline ? currentIDs.subtracting(lastPresentIDs) : []
@@ -1339,11 +1340,12 @@ final class DeviceLocationLayer {
         """)
     }
 
-    private func networkObservations(from devices: [Device], routerIP: String?, aliases: [String: String]) -> [Observation] {
+    private func networkObservations(from devices: [Device], localInfo: LocalAddressInfo, routerIP: String?, aliases: [String: String]) -> [Observation] {
         let normalizedRouterIP = routerIP?.trimmingCharacters(in: .whitespacesAndNewlines)
         return devices.compactMap { device in
             let saved = savedClassification(for: device.id)
             guard !saved.ignored else { return nil }
+            guard !isRadarNoise(device: device, localInfo: localInfo) else { return nil }
             let isRouter = device.ip == normalizedRouterIP
             let name = aliases[device.id]
                 ?? (device.hostname?.isEmpty == false ? device.hostname! : nil)
@@ -1388,6 +1390,20 @@ final class DeviceLocationLayer {
         )
     }
 
+    private func isRadarNoise(device: Device, localInfo: LocalAddressInfo) -> Bool {
+        if let localIP = localInfo.ip, device.ip == localIP {
+            return true
+        }
+        if device.ip.hasSuffix(".0") || device.ip.hasSuffix(".255") {
+            return true
+        }
+        let mac = device.mac.lowercased()
+        if mac == "ff:ff:ff:ff:ff:ff" || mac == "0:0:0:0:0:0" || mac == "00:00:00:00:00:00" {
+            return true
+        }
+        return false
+    }
+
     private func savedClassification(for id: String) -> (classification: String?, ignored: Bool) {
         let output = sqliteOutput("SELECT COALESCE(user_classification, ''), ignored FROM devices WHERE id = \(sqlValue(id));")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1406,7 +1422,32 @@ final class DeviceLocationLayer {
 
         var observations: [Observation] = []
         collectBluetoothObjects(json, into: &observations)
-        return observations
+        return deduplicatedObservations(observations)
+    }
+
+    private func deduplicatedObservations(_ observations: [Observation]) -> [Observation] {
+        var seen: [String: Observation] = [:]
+
+        for observation in observations {
+            let key: String
+            if let mac = observation.mac?.lowercased(), !mac.isEmpty {
+                key = "\(observation.source):\(mac)"
+            } else if let ip = observation.ip, !ip.isEmpty {
+                key = "\(observation.source):\(ip)"
+            } else {
+                key = "\(observation.source):\(observation.name.lowercased())"
+            }
+
+            if let existing = seen[key] {
+                if existing.rssi == nil && observation.rssi != nil {
+                    seen[key] = observation
+                }
+            } else {
+                seen[key] = observation
+            }
+        }
+
+        return Array(seen.values)
     }
 
     private func collectBluetoothObjects(_ object: Any, into observations: inout [Observation]) {
