@@ -218,7 +218,11 @@ final class StateStore {
 }
 
 final class NetworkScanner {
-    func scan(previousDevices: [String: Device]) -> [Device] {
+    func scan(previousDevices: [String: Device], localInfo: LocalAddressInfo, activeLookup: Bool = true) -> [Device] {
+        if activeLookup {
+            probeLocalSubnet(from: localInfo.ip)
+        }
+
         let now = Date()
         let output = run("/usr/sbin/arp", ["-a"])
         let devices = output
@@ -227,6 +231,60 @@ final class NetworkScanner {
 
         return devices.sorted { lhs, rhs in
             compareIPv4(lhs.ip, rhs.ip)
+        }
+    }
+
+    private func probeLocalSubnet(from localIP: String?) {
+        guard let targets = localSubnetTargets(from: localIP), !targets.isEmpty else { return }
+
+        let queue = DispatchQueue(label: "netbar.local-lookup", attributes: .concurrent)
+        let group = DispatchGroup()
+        let limit = DispatchSemaphore(value: 32)
+
+        for target in targets {
+            limit.wait()
+            group.enter()
+            queue.async {
+                self.runPingProbe(target)
+                limit.signal()
+                group.leave()
+            }
+        }
+
+        _ = group.wait(timeout: .now() + 6)
+    }
+
+    private func localSubnetTargets(from localIP: String?) -> [String]? {
+        guard let localIP else { return nil }
+        let parts = localIP.split(separator: ".").compactMap { Int($0) }
+        guard parts.count == 4, isPrivateIPv4(parts) else { return nil }
+
+        let prefix = "\(parts[0]).\(parts[1]).\(parts[2])"
+        return (1...254)
+            .filter { $0 != parts[3] }
+            .map { "\(prefix).\($0)" }
+    }
+
+    private func isPrivateIPv4(_ parts: [Int]) -> Bool {
+        guard parts.count == 4 else { return false }
+        return parts[0] == 10
+            || (parts[0] == 172 && (16...31).contains(parts[1]))
+            || (parts[0] == 192 && parts[1] == 168)
+            || (parts[0] == 169 && parts[1] == 254)
+    }
+
+    private func runPingProbe(_ ip: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/sbin/ping")
+        process.arguments = ["-c", "1", "-W", "350", ip]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return
         }
     }
 
@@ -1026,6 +1084,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastRefresh: Date?
     private var hasCompletedInitialScan = false
     private var newDeviceHighlights: [String: Date] = [:]
+    private var isRefreshing = false
     private var timer: Timer?
     private var startupError: String?
     private var sharingPicker: NSSharingServicePicker?
@@ -1057,11 +1116,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func refresh(_ sender: Any?) {
-        localInfo = scanner.localAddressInfo()
-        let previousIDs = Set(devicesByID.keys)
-        devices = scanner.scan(previousDevices: devicesByID)
-        let now = Date()
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        rebuildMenu()
 
+        let previousDevices = devicesByID
+        let previousIDs = Set(previousDevices.keys)
+        let scanner = self.scanner
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let localInfo = scanner.localAddressInfo()
+            let devices = scanner.scan(previousDevices: previousDevices, localInfo: localInfo, activeLookup: true)
+            let now = Date()
+
+            DispatchQueue.main.async {
+                self?.finishRefresh(
+                    devices: devices,
+                    localInfo: localInfo,
+                    previousIDs: previousIDs,
+                    now: now
+                )
+            }
+        }
+    }
+
+    private func finishRefresh(devices refreshedDevices: [Device], localInfo refreshedLocalInfo: LocalAddressInfo, previousIDs: Set<String>, now: Date) {
+        localInfo = refreshedLocalInfo
+        devices = refreshedDevices
         if hasCompletedInitialScan {
             for device in devices where !previousIDs.contains(device.id) {
                 newDeviceHighlights[device.id] = now
@@ -1073,6 +1154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         devicesByID = Dictionary(uniqueKeysWithValues: devices.map { ($0.id, $0) })
         pruneNewDeviceHighlights(now: now)
         lastRefresh = now
+        isRefreshing = false
         rebuildMenu()
         updateNetworkMap()
     }
@@ -1087,7 +1169,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let refreshed = lastRefresh.map { timeFormatter.string(from: $0) } ?? "Never"
         let newCount = devices.filter { isNewDevice($0) }.count
         let newSummary = newCount > 0 ? " - \(newCount) new" : ""
-        let summary = NSMenuItem(title: "\(devices.count) seen\(newSummary) - refreshed \(refreshed)", action: nil, keyEquivalent: "")
+        let summaryTitle = isRefreshing
+            ? "Looking up local network..."
+            : "\(devices.count) seen\(newSummary) - refreshed \(refreshed)"
+        let summary = NSMenuItem(title: summaryTitle, action: nil, keyEquivalent: "")
         summary.isEnabled = false
         menu.addItem(summary)
 

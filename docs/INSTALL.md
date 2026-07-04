@@ -61,6 +61,10 @@ NetBar stores its LaunchAgent at:
 
 NetBar uses the first scan after launch as its baseline. Devices that appear after that are marked `NEW` in the Menu Bar list and highlighted on the Network Map for a few minutes.
 
+## Local Network Lookup
+
+On refresh, NetBar briefly probes the private/local IPv4 subnet for this Mac's active LAN address. That network access helps macOS populate the ARP table, which makes the device list and Network Map more complete.
+
 ## Ping a Device
 
 Open a device submenu and choose `Ping IP (6 avg)`. NetBar sends 6 pings and reports the average response time. If no reply arrives within 6 seconds, the result is shown as a bad ping.

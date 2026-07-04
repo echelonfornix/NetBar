@@ -2,13 +2,14 @@
 
 NetBar is a small macOS Menu Bar app for seeing what your Mac currently knows about devices on your local network.
 
-It sits quietly in the Menu Bar, refreshes from the macOS ARP table, and shows nearby devices with IP address, optional MAC address, friendly names, guessed device type, and a simple network map.
+It sits quietly in the Menu Bar, performs a local-network lookup, reads the macOS ARP table, and shows nearby devices with IP address, optional MAC address, friendly names, guessed device type, and a simple network map.
 
 Designed by Simon Stevens.
 
 ## What It Shows
 
 - Devices recently visible in your Mac's ARP table.
+- Active local subnet lookup on private LAN ranges, so nearby devices are easier to discover.
 - IP address and network interface, such as `en0`.
 - Optional MAC address display.
 - First seen and last refreshed times.
@@ -21,11 +22,11 @@ Designed by Simon Stevens.
 
 ## Important Limits
 
-NetBar is deliberately lightweight. It reads information your Mac already has rather than aggressively scanning the network.
+NetBar is deliberately lightweight. It performs a short local-only lookup on your private LAN, then reads information your Mac has learned in the ARP table.
 
 That means:
 
-- Devices may only appear after your Mac has talked to them or recently discovered them.
+- Devices may only appear if they respond on the local network or are visible in your Mac's ARP table.
 - DHCP/static status can only be known reliably for this Mac's own active interface.
 - Other devices are shown as `DHCP/static unknown` unless their ARP entry itself is permanent.
 - Device type guesses are hints, not facts. MAC address privacy features can make phones and laptops look anonymous.
