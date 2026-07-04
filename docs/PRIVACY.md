@@ -17,6 +17,7 @@ It stores:
 - Whether MAC addresses should be visible in the menu.
 - Whether Launch at Login should be enabled.
 - Device Location Layer snapshots, observations, confidence scores, and learned baselines.
+- Local identity profiles for friendly-named devices, including recent IPs, MACs, hostnames, zones, and optional locked MAC addresses.
 
 Stored data location:
 

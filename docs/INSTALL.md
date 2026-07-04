@@ -77,6 +77,8 @@ Use the pencil in the selected-device panel to save a friendly name. That name i
 
 The radar view filters this Mac and broadcast addresses, then deduplicates repeated Bluetooth records so the view stays focused on real device dots.
 
+Named devices build an identity profile over time. NetBar remembers recent IPs, MACs, hostnames, and radar zones for that friendly name. If only the IP matches, NetBar treats it as tentative because another device could receive the same address later. Use `Identity: Lock Current MAC` from a named device's menu when you want strict MAC matching for devices that do not rotate private addresses.
+
 The layer stores snapshots locally in:
 
 ```text

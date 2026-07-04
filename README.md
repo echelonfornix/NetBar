@@ -23,6 +23,7 @@ Designed by Simon Stevens.
 - The Device Radar includes the router anchor, a Network Map-matched key, and a selected-device details panel with IP and optional MAC address.
 - Device Radar details include a pencil rename action that saves the same friendly name used by the Menu Bar list and Network Map.
 - Device Radar filters this Mac and broadcast addresses, and deduplicates repeated Bluetooth records before drawing radar dots.
+- Named devices build local identity profiles from recent IPs, MACs, hostnames, and radar zones. IP-only matches are treated as tentative, and MAC addresses can be locked when you want strict identity matching.
 
 ## Important Limits
 

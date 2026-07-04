@@ -46,6 +46,24 @@ struct PingResult {
     }
 }
 
+struct DeviceIdentityProfile: Codable {
+    var name: String
+    var deviceIDs: [String] = []
+    var macs: [String] = []
+    var ips: [String] = []
+    var hostnames: [String] = []
+    var lockedMacs: [String] = []
+    var lastZone: String?
+    var lastSeen: Date?
+}
+
+struct DeviceIdentityContext {
+    var alias: String?
+    var note: String?
+    var isMacLocked: Bool
+    var previousZone: String?
+}
+
 enum DeviceClassifier {
     static func classify(device: Device, name: String) -> DeviceGuess {
         let text = "\(name) \(device.hostname ?? "") \(device.mac)".lowercased()
@@ -164,11 +182,13 @@ enum DeviceClassifier {
 
 struct StoredState: Codable {
     var aliases: [String: String] = [:]
+    var identityProfiles: [String: DeviceIdentityProfile] = [:]
     var showMacAddresses: Bool = false
     var launchAtLoginEnabled: Bool = true
 
     enum CodingKeys: String, CodingKey {
         case aliases
+        case identityProfiles
         case showMacAddresses
         case launchAtLoginEnabled
     }
@@ -178,6 +198,7 @@ struct StoredState: Codable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         aliases = try container.decodeIfPresent([String: String].self, forKey: .aliases) ?? [:]
+        identityProfiles = try container.decodeIfPresent([String: DeviceIdentityProfile].self, forKey: .identityProfiles) ?? [:]
         showMacAddresses = try container.decodeIfPresent(Bool.self, forKey: .showMacAddresses) ?? false
         launchAtLoginEnabled = try container.decodeIfPresent(Bool.self, forKey: .launchAtLoginEnabled) ?? true
     }
@@ -210,7 +231,7 @@ final class StateStore {
     }
 
     func alias(for device: Device) -> String? {
-        state.aliases[device.id]
+        state.aliases[device.id] ?? identityContext(for: device).alias
     }
 
     func setAlias(_ alias: String?, for deviceID: String) {
@@ -219,8 +240,154 @@ final class StateStore {
             state.aliases.removeValue(forKey: deviceID)
         } else {
             state.aliases[deviceID] = trimmed
+            var profile = profile(named: trimmed)
+            profile.deviceIDs = appendUnique(deviceID, to: profile.deviceIDs, limit: 12)
+            state.identityProfiles[profileKey(for: trimmed)] = profile
         }
         save()
+    }
+
+    func identityContexts(for devices: [Device]) -> [String: DeviceIdentityContext] {
+        Dictionary(uniqueKeysWithValues: devices.map { ($0.id, identityContext(for: $0)) })
+    }
+
+    func recordIdentities(from nodes: [DeviceLocationRadarNode]) {
+        var didChange = false
+        for node in nodes {
+            guard shouldRecordIdentity(for: node),
+                  let name = displayNameForIdentity(node),
+                  !name.isEmpty else { continue }
+            var profile = profile(named: name)
+            let isTentativeIPMatch = node.identityNote?.hasPrefix("IP matches") == true
+            if !isTentativeIPMatch {
+                profile.deviceIDs = appendUnique(node.id, to: profile.deviceIDs, limit: 12)
+                if let mac = node.mac?.lowercased(), !mac.isEmpty {
+                    profile.macs = appendUnique(mac, to: profile.macs, limit: 12)
+                }
+            }
+            if let ip = node.ip, !ip.isEmpty {
+                profile.ips = appendUnique(ip, to: profile.ips, limit: 12)
+            }
+            profile.hostnames = appendUnique(name.lowercased(), to: profile.hostnames, limit: 8)
+            profile.lastZone = node.zone
+            profile.lastSeen = Date()
+            state.identityProfiles[profileKey(for: name)] = profile
+            didChange = true
+        }
+        if didChange {
+            save()
+        }
+    }
+
+    func lockMAC(for node: DeviceLocationRadarNode) -> Bool {
+        guard let mac = node.mac?.lowercased(), !mac.isEmpty,
+              let name = displayNameForIdentity(node) else {
+            return false
+        }
+        var profile = profile(named: name)
+        profile.deviceIDs = appendUnique(node.id, to: profile.deviceIDs, limit: 12)
+        profile.macs = appendUnique(mac, to: profile.macs, limit: 12)
+        profile.lockedMacs = appendUnique(mac, to: profile.lockedMacs, limit: 8)
+        if let ip = node.ip, !ip.isEmpty {
+            profile.ips = appendUnique(ip, to: profile.ips, limit: 12)
+        }
+        profile.lastZone = node.zone
+        profile.lastSeen = Date()
+        state.identityProfiles[profileKey(for: name)] = profile
+        save()
+        return true
+    }
+
+    func lockMAC(for device: Device, name: String) {
+        var profile = profile(named: name)
+        profile.deviceIDs = appendUnique(device.id, to: profile.deviceIDs, limit: 12)
+        profile.macs = appendUnique(device.mac.lowercased(), to: profile.macs, limit: 12)
+        profile.lockedMacs = appendUnique(device.mac.lowercased(), to: profile.lockedMacs, limit: 8)
+        profile.ips = appendUnique(device.ip, to: profile.ips, limit: 12)
+        if let hostname = device.hostname?.lowercased(), !hostname.isEmpty {
+            profile.hostnames = appendUnique(hostname, to: profile.hostnames, limit: 8)
+        }
+        profile.lastSeen = Date()
+        state.identityProfiles[profileKey(for: name)] = profile
+        save()
+    }
+
+    private func identityContext(for device: Device) -> DeviceIdentityContext {
+        if let directAlias = state.aliases[device.id], !directAlias.isEmpty {
+            let profile = profile(named: directAlias)
+            return DeviceIdentityContext(
+                alias: directAlias,
+                note: profile.lockedMacs.contains(device.mac.lowercased()) ? "MAC locked match" : "Saved name match",
+                isMacLocked: profile.lockedMacs.contains(device.mac.lowercased()),
+                previousZone: profile.lastZone
+            )
+        }
+
+        let mac = device.mac.lowercased()
+        let hostname = device.hostname?.lowercased()
+        var bestContext = DeviceIdentityContext(alias: nil, note: nil, isMacLocked: false, previousZone: nil)
+
+        for profile in state.identityProfiles.values {
+            let lockedMatch = profile.lockedMacs.contains(mac)
+            if profile.deviceIDs.contains(device.id) || profile.macs.contains(mac) || lockedMatch {
+                return DeviceIdentityContext(
+                    alias: profile.name,
+                    note: lockedMatch ? "MAC locked match" : "Known MAC/device identity",
+                    isMacLocked: lockedMatch,
+                    previousZone: profile.lastZone
+                )
+            }
+
+            if let hostname, !hostname.isEmpty, profile.hostnames.contains(hostname) {
+                bestContext = DeviceIdentityContext(
+                    alias: profile.name,
+                    note: "Hostname matches saved identity",
+                    isMacLocked: false,
+                    previousZone: profile.lastZone
+                )
+            } else if profile.ips.contains(device.ip), bestContext.alias == nil {
+                let lockedMismatch = !profile.lockedMacs.isEmpty && !profile.lockedMacs.contains(mac)
+                bestContext = DeviceIdentityContext(
+                    alias: profile.name,
+                    note: lockedMismatch ? "IP matches \(profile.name), but locked MAC differs" : "IP matches saved identity; confirm if MAC rotated",
+                    isMacLocked: false,
+                    previousZone: profile.lastZone
+                )
+            }
+        }
+
+        return bestContext
+    }
+
+    private func profile(named name: String) -> DeviceIdentityProfile {
+        let key = profileKey(for: name)
+        return state.identityProfiles[key] ?? DeviceIdentityProfile(name: name)
+    }
+
+    private func profileKey(for name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private func appendUnique(_ value: String, to values: [String], limit: Int) -> [String] {
+        let cleaned = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return values }
+        var next = values.filter { $0 != cleaned }
+        next.insert(cleaned, at: 0)
+        return Array(next.prefix(limit))
+    }
+
+    private func shouldRecordIdentity(for node: DeviceLocationRadarNode) -> Bool {
+        state.aliases[node.id] != nil || state.identityProfiles[profileKey(for: node.title)] != nil
+    }
+
+    private func displayNameForIdentity(_ node: DeviceLocationRadarNode) -> String? {
+        if let alias = state.aliases[node.id], !alias.isEmpty {
+            return alias
+        }
+        if state.identityProfiles[profileKey(for: node.title)] != nil {
+            return node.title
+        }
+        return nil
     }
 
     func setShowMacAddresses(_ show: Bool) {
@@ -1135,6 +1302,9 @@ struct DeviceLocationRadarNode {
     var radius: CGFloat
     var isLeftBehind: Bool
     var isNew: Bool
+    var identityNote: String?
+    var movementNote: String?
+    var isMacLocked: Bool
 }
 
 final class DeviceLocationLayer {
@@ -1151,6 +1321,9 @@ final class DeviceLocationLayer {
         var icon: String
         var accent: NSColor
         var confidenceHint: String
+        var identityNote: String?
+        var previousZone: String?
+        var isMacLocked: Bool
     }
 
     private let dbURL: URL
@@ -1195,13 +1368,13 @@ final class DeviceLocationLayer {
         return "scanning"
     }
 
-    func recordSnapshot(devices: [Device], localInfo: LocalAddressInfo, routerIP: String?, aliases: [String: String] = [:]) {
+    func recordSnapshot(devices: [Device], localInfo: LocalAddressInfo, routerIP: String?, aliases: [String: String] = [:], identityContexts: [String: DeviceIdentityContext] = [:]) {
         guard !isPaused else { return }
 
         let now = Date()
         let snapshotID = Int(now.timeIntervalSince1970 * 1000)
         let wifi = wifiInfo()
-        var observations = networkObservations(from: devices, localInfo: localInfo, routerIP: routerIP, aliases: aliases)
+        var observations = networkObservations(from: devices, localInfo: localInfo, routerIP: routerIP, aliases: aliases, identityContexts: identityContexts)
         addRouterObservationIfNeeded(to: &observations, routerIP: routerIP, aliases: aliases)
         observations.append(contentsOf: bluetoothObservations())
         observations = deduplicatedObservations(observations)
@@ -1340,14 +1513,16 @@ final class DeviceLocationLayer {
         """)
     }
 
-    private func networkObservations(from devices: [Device], localInfo: LocalAddressInfo, routerIP: String?, aliases: [String: String]) -> [Observation] {
+    private func networkObservations(from devices: [Device], localInfo: LocalAddressInfo, routerIP: String?, aliases: [String: String], identityContexts: [String: DeviceIdentityContext]) -> [Observation] {
         let normalizedRouterIP = routerIP?.trimmingCharacters(in: .whitespacesAndNewlines)
         return devices.compactMap { device in
             let saved = savedClassification(for: device.id)
             guard !saved.ignored else { return nil }
             guard !isRadarNoise(device: device, localInfo: localInfo) else { return nil }
             let isRouter = device.ip == normalizedRouterIP
-            let name = aliases[device.id]
+            let identityContext = identityContexts[device.id]
+            let name = identityContext?.alias
+                ?? aliases[device.id]
                 ?? (device.hostname?.isEmpty == false ? device.hostname! : nil)
                 ?? (isRouter ? "Router / Gateway" : "Device \(lastOctet(of: device.ip))")
             let guess = DeviceClassifier.classify(device: device, name: name)
@@ -1364,7 +1539,10 @@ final class DeviceLocationLayer {
                 displayType: isRouter ? "Router" : guess.label,
                 icon: isRouter ? "📡" : guess.icon,
                 accent: isRouter ? .systemBlue : guess.accent,
-                confidenceHint: guess.confidence
+                confidenceHint: guess.confidence,
+                identityNote: identityContext?.note,
+                previousZone: identityContext?.previousZone,
+                isMacLocked: identityContext?.isMacLocked ?? false
             )
         }
     }
@@ -1385,7 +1563,10 @@ final class DeviceLocationLayer {
                 displayType: "Router",
                 icon: "📡",
                 accent: .systemBlue,
-                confidenceHint: "medium"
+                confidenceHint: "medium",
+                identityNote: aliases[id] == nil ? nil : "Saved router name",
+                previousZone: nil,
+                isMacLocked: false
             )
         )
     }
@@ -1475,7 +1656,10 @@ final class DeviceLocationLayer {
                         displayType: "Bluetooth",
                         icon: "📱",
                         accent: .systemPurple,
-                        confidenceHint: rssiValue == nil ? "low" : "medium"
+                        confidenceHint: rssiValue == nil ? "low" : "medium",
+                        identityNote: nil,
+                        previousZone: nil,
+                        isMacLocked: false
                     )
                 )
             }
@@ -1593,6 +1777,7 @@ final class DeviceLocationLayer {
             let zone = isRouterObservation ? "Near router" : zoneLabel(for: observation)
             let state = "\(nodeTitle): \(zone), \(nodeCategory), confidence \(Int(confidence.rounded()))%"
             let isLeftBehind = leftBehindScore >= 60
+            let movementNote = movementNote(from: observation.previousZone, to: zone)
 
             if observation.inferredClass == "mobile" || observation.inferredClass == "semi-static" {
                 mobileCount += 1
@@ -1619,7 +1804,10 @@ final class DeviceLocationLayer {
                     angle: angle(for: observation.id),
                     radius: isRouterObservation ? 0.92 : radius(for: observation),
                     isLeftBehind: isLeftBehind,
-                    isNew: appeared.contains(observation.id)
+                    isNew: appeared.contains(observation.id),
+                    identityNote: observation.identityNote,
+                    movementNote: movementNote,
+                    isMacLocked: observation.isMacLocked
                 )
             )
 
@@ -1726,6 +1914,14 @@ final class DeviceLocationLayer {
             return "Home network present"
         }
         return "Unknown"
+    }
+
+    private func movementNote(from previousZone: String?, to zone: String) -> String? {
+        guard let previousZone, !previousZone.isEmpty else { return nil }
+        if previousZone == zone {
+            return "Stable in \(zone)"
+        }
+        return "Moved: \(previousZone) → \(zone)"
     }
 
     private func accent(for inferredClass: String, source: String) -> NSColor {
@@ -2104,12 +2300,17 @@ final class DeviceLocationRadarView: NSView {
         let macText = showMacAddresses ? (node.mac ?? "No MAC observed") : "Hidden - enable Show MAC addresses"
         drawText("IP: \(ipText)", in: NSRect(x: rect.minX + 74, y: rect.minY + 72, width: rect.width * 0.38, height: 18), font: .monospacedSystemFont(ofSize: 12, weight: .regular), color: .labelColor)
         drawText("MAC: \(macText)", in: NSRect(x: rect.minX + 74, y: rect.minY + 96, width: rect.width * 0.48, height: 18), font: .monospacedSystemFont(ofSize: 12, weight: .regular), color: .secondaryLabelColor)
+        let lockText = node.isMacLocked ? "Identity: MAC locked" : (node.identityNote ?? node.movementNote ?? "Identity: learning")
+        drawText(lockText, in: NSRect(x: rect.minX + 74, y: rect.minY + 120, width: rect.width * 0.48, height: 18), font: .systemFont(ofSize: 12, weight: node.isMacLocked ? .medium : .regular), color: node.isMacLocked ? .systemGreen : .secondaryLabelColor)
 
         let rightX = rect.midX + 38
         drawText("Recent", in: NSRect(x: rightX, y: rect.minY + 17, width: rect.maxX - rightX - 18, height: 18), font: .systemFont(ofSize: 12, weight: .semibold), color: .secondaryLabelColor)
         var y = rect.minY + 41
         for change in recentChanges.prefix(3) {
             y = drawWrapped(change, x: rightX, y: y, width: rect.maxX - rightX - 18, color: .labelColor, height: 26)
+        }
+        if let movementNote = node.movementNote, node.identityNote != nil {
+            drawText(movementNote, in: NSRect(x: rightX, y: rect.maxY - 54, width: rect.maxX - rightX - 18, height: 18), font: .systemFont(ofSize: 12, weight: .regular), color: .secondaryLabelColor)
         }
         if node.isNew {
             drawText("New in the current baseline window", in: NSRect(x: rightX, y: rect.maxY - 32, width: rect.maxX - rightX - 18, height: 18), font: .systemFont(ofSize: 12, weight: .medium), color: node.accent)
@@ -2275,20 +2476,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let previousIDs = Set(previousDevices.keys)
         let scanner = self.scanner
         let locationLayer = self.locationLayer
-        let aliases = store.state.aliases
+        let store = self.store
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let localInfo = scanner.localAddressInfo()
             let devices = scanner.scan(previousDevices: previousDevices, localInfo: localInfo, activeLookup: true)
             let routerIP = scanner.gatewayIPAddress(localInfo: localInfo)
+            let identityContexts = store.identityContexts(for: devices)
+            let aliases = Dictionary(uniqueKeysWithValues: identityContexts.compactMap { entry in
+                entry.value.alias.map { (entry.key, $0) }
+            })
             let locationDevices = devices.map { device -> Device in
                 var copy = device
-                if let alias = aliases[device.id], !alias.isEmpty {
+                if let alias = identityContexts[device.id]?.alias, !alias.isEmpty {
                     copy.hostname = alias
                 }
                 return copy
             }
-            locationLayer.recordSnapshot(devices: locationDevices, localInfo: localInfo, routerIP: routerIP, aliases: aliases)
+            locationLayer.recordSnapshot(
+                devices: locationDevices,
+                localInfo: localInfo,
+                routerIP: routerIP,
+                aliases: aliases,
+                identityContexts: identityContexts
+            )
             let now = Date()
 
             DispatchQueue.main.async {
@@ -2317,6 +2528,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pruneNewDeviceHighlights(now: now)
         lastRefresh = now
         isRefreshing = false
+        store.recordIdentities(from: locationLayer.radarNodes)
         rebuildMenu()
         updateNetworkMap()
         updateDeviceLocationWindow()
@@ -2502,6 +2714,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ignoreLocation.target = self
         ignoreLocation.representedObject = ["id": device.id, "class": "ignored"]
         submenu.addItem(ignoreLocation)
+
+        submenu.addItem(.separator())
+
+        let lockMAC = NSMenuItem(title: "Identity: Lock Current MAC", action: #selector(lockDeviceMAC(_:)), keyEquivalent: "")
+        lockMAC.target = self
+        lockMAC.representedObject = device.id
+        lockMAC.isEnabled = displayName(for: device) != "Device"
+        submenu.addItem(lockMAC)
 
         submenu.addItem(.separator())
 
@@ -2747,6 +2967,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             locationLayer.markDevice(id: deviceID, name: label, classification: classification, ignored: false)
         }
+        refresh(nil)
+    }
+
+    @objc private func lockDeviceMAC(_ sender: NSMenuItem) {
+        guard let deviceID = sender.representedObject as? String,
+              let device = devicesByID[deviceID] else { return }
+        let name = displayName(for: device)
+        guard name != "Device" else {
+            showError("Name the device first.", detail: "A MAC lock needs a friendly device name so NetBar knows which identity it belongs to.")
+            return
+        }
+        store.lockMAC(for: device, name: name)
         refresh(nil)
     }
 
