@@ -51,6 +51,8 @@ dist/NetBar.dmg
 
 Open NetBar settings and enable Launch at Login.
 
+The setting is saved in NetBar's local state file. If you turn Launch at Login off, NetBar will not reinstall the LaunchAgent the next time it opens.
+
 NetBar stores its LaunchAgent at:
 
 ```text

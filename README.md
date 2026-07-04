@@ -104,6 +104,8 @@ NetBar can install a per-user LaunchAgent so it reopens when you log in:
 
 You can turn this on or off from NetBar's settings.
 
+The setting is saved, so turning Launch at Login off stays off after the app restarts.
+
 ## Privacy
 
 NetBar runs locally on your Mac. It does not upload your network data.

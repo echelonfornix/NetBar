@@ -13,6 +13,7 @@ It stores:
 
 - Friendly names you assign to devices.
 - Whether MAC addresses should be visible in the menu.
+- Whether Launch at Login should be enabled.
 
 Stored data location:
 

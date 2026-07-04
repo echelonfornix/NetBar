@@ -165,6 +165,22 @@ enum DeviceClassifier {
 struct StoredState: Codable {
     var aliases: [String: String] = [:]
     var showMacAddresses: Bool = false
+    var launchAtLoginEnabled: Bool = true
+
+    enum CodingKeys: String, CodingKey {
+        case aliases
+        case showMacAddresses
+        case launchAtLoginEnabled
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        aliases = try container.decodeIfPresent([String: String].self, forKey: .aliases) ?? [:]
+        showMacAddresses = try container.decodeIfPresent(Bool.self, forKey: .showMacAddresses) ?? false
+        launchAtLoginEnabled = try container.decodeIfPresent(Bool.self, forKey: .launchAtLoginEnabled) ?? true
+    }
 }
 
 final class StateStore {
@@ -209,6 +225,11 @@ final class StateStore {
 
     func setShowMacAddresses(_ show: Bool) {
         state.showMacAddresses = show
+        save()
+    }
+
+    func setLaunchAtLoginEnabled(_ enabled: Bool) {
+        state.launchAtLoginEnabled = enabled
         save()
     }
 
@@ -508,9 +529,11 @@ final class StartupManager {
         FileManager.default.fileExists(atPath: launchAgentURL.path)
     }
 
-    func ensureInstalled() throws {
-        if !isInstalled {
+    func sync(enabled: Bool) throws {
+        if enabled {
             try install()
+        } else {
+            try uninstall()
         }
     }
 
@@ -549,7 +572,7 @@ final class SettingsWindowController: NSWindowController {
         self.onSettingsChanged = onSettingsChanged
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 230),
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 250),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -634,19 +657,21 @@ final class SettingsWindowController: NSWindowController {
     }
 
     func syncControls() {
-        launchAtLoginButton.state = startupManager.isInstalled ? .on : .off
+        launchAtLoginButton.state = store.state.launchAtLoginEnabled ? .on : .off
         showMACButton.state = store.state.showMacAddresses ? .on : .off
-        statusLabel.stringValue = "Launch setting: \(startupManager.isInstalled ? "on" : "off"). MAC display: \(store.state.showMacAddresses ? "on" : "off")."
+        let launchSetting = store.state.launchAtLoginEnabled ? "on" : "off"
+        let launchAgent = startupManager.isInstalled ? "installed" : "not installed"
+        let macDisplay = store.state.showMacAddresses ? "shown" : "hidden"
+        statusLabel.stringValue = "Launch at login: \(launchSetting) (\(launchAgent)). MAC addresses: \(macDisplay)."
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSButton) {
+        let enabled = sender.state == .on
         do {
-            if sender.state == .on {
-                try startupManager.install()
-            } else {
-                try startupManager.uninstall()
-            }
+            store.setLaunchAtLoginEnabled(enabled)
+            try startupManager.sync(enabled: enabled)
         } catch {
+            store.setLaunchAtLoginEnabled(!enabled)
             showError("Launch at Login could not be changed.", detail: error.localizedDescription)
         }
 
@@ -1104,7 +1129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         do {
-            try startupManager.ensureInstalled()
+            try startupManager.sync(enabled: store.state.launchAtLoginEnabled)
         } catch {
             startupError = error.localizedDescription
         }
@@ -1196,7 +1221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let launchAtLogin = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
         launchAtLogin.target = self
-        launchAtLogin.state = startupManager.isInstalled ? .on : .off
+        launchAtLogin.state = store.state.launchAtLoginEnabled ? .on : .off
         menu.addItem(launchAtLogin)
 
         let showMAC = NSMenuItem(title: "Show MAC addresses", action: #selector(toggleShowMacAddresses(_:)), keyEquivalent: "")
@@ -1332,17 +1357,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleShowMacAddresses(_ sender: NSMenuItem) {
         store.setShowMacAddresses(!store.state.showMacAddresses)
         rebuildMenu()
+        settingsWindowController?.syncControls()
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
+        let enabled = !store.state.launchAtLoginEnabled
         do {
-            if startupManager.isInstalled {
-                try startupManager.uninstall()
-            } else {
-                try startupManager.install()
-            }
+            store.setLaunchAtLoginEnabled(enabled)
+            try startupManager.sync(enabled: enabled)
             startupError = nil
         } catch {
+            store.setLaunchAtLoginEnabled(!enabled)
             startupError = error.localizedDescription
             showError("Launch at Login could not be changed.", detail: error.localizedDescription)
         }
@@ -1555,7 +1580,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showInfoPane(_ sender: NSMenuItem) {
         NSApp.activate(ignoringOtherApps: true)
 
-        let startupLine = startupManager.isInstalled ? "Launch at login: On" : "Launch at login: Off"
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Unknown"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "Unknown"
+        let startupSetting = store.state.launchAtLoginEnabled ? "On" : "Off"
+        let startupAgent = startupManager.isInstalled ? "installed" : "not installed"
+        let macLine = store.state.showMacAddresses ? "MAC addresses: Shown in menu" : "MAC addresses: Hidden in menu"
         let startupDetail = startupError.map { "\nStartup setup note: \($0)" } ?? ""
         let appPath = Bundle.main.bundleURL.path
 
@@ -1564,8 +1593,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = """
         Designed by Simon Stevens
 
-        Shows recently seen local network devices from this Mac's ARP table.
-        \(startupLine)
+        Version: \(version) (\(build))
+        Local network lookup: On
+        Launch at login: \(startupSetting) (\(startupAgent))
+        \(macLine)
+
+        NetBar briefly probes this Mac's private/local subnet, reads the macOS ARP table, highlights newly discovered devices, and can ping a selected IP 6 times for an average.
+
+        Network data stays local. NetBar does not upload analytics or contact a remote service.
 
         Sharing creates a DMG of this signed local build. Without a Developer ID certificate, other Macs may still ask for approval in Privacy & Security.
 
