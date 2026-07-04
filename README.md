@@ -19,6 +19,7 @@ Designed by Simon Stevens.
 - A visual Network Map with the router, this Mac, and discovered devices.
 - New devices are highlighted in both the Menu Bar list and Network Map for a few minutes after they appear.
 - A per-device Ping IP action sends 6 pings and reports the average, or marks it as a bad ping if no reply arrives within 6 seconds.
+- A Device Location Layer that takes background snapshots, stores them in local SQLite, and shows a radar-style confidence view for likely presence, mobility, novelty, and possible left-behind devices.
 
 ## Important Limits
 
@@ -30,6 +31,8 @@ That means:
 - DHCP/static status can only be known reliably for this Mac's own active interface.
 - Other devices are shown as `DHCP/static unknown` unless their ARP entry itself is permanent.
 - Device type guesses are hints, not facts. MAC address privacy features can make phones and laptops look anonymous.
+- The Device Location Layer does not claim GPS or exact indoor positioning. It uses repeated local observations and confidence bands such as near Mac, home network present, Bluetooth nearby, away, or unknown.
+- Ping is only used for presence/liveness. NetBar does not use ping timing as a distance measurement.
 
 ## Download and Install
 
@@ -114,6 +117,12 @@ It stores friendly names and the MAC visibility preference here:
 
 ```text
 ~/Library/Application Support/NetBar/state.json
+```
+
+The Device Location Layer stores local snapshots and confidence scores here:
+
+```text
+~/Library/Application Support/NetBar/device-location-layer.sqlite
 ```
 
 See [docs/PRIVACY.md](docs/PRIVACY.md) for more detail.

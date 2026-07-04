@@ -343,16 +343,45 @@ final class NetworkScanner {
         return LocalAddressInfo(interfaceName: interfaceName, ip: ip, assignment: assignment)
     }
 
-    func gatewayIPAddress() -> String? {
+    func gatewayIPAddress(localInfo: LocalAddressInfo? = nil) -> String? {
+        if let interfaceName = localInfo?.interfaceName,
+           !isTunnelInterface(interfaceName),
+           let gateway = gatewayIPAddressFromRoutingTable(interfaceName: interfaceName) {
+            return gateway
+        }
+
         let output = run("/sbin/route", ["-n", "get", "default"])
         for line in output.split(separator: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("gateway:") {
-                return trimmed.replacingOccurrences(of: "gateway:", with: "")
+                let gateway = trimmed.replacingOccurrences(of: "gateway:", with: "")
                     .trimmingCharacters(in: .whitespaces)
+                if isPrivateIPv4String(gateway) {
+                    return gateway
+                }
             }
         }
         return nil
+    }
+
+    private func gatewayIPAddressFromRoutingTable(interfaceName: String) -> String? {
+        let output = run("/usr/sbin/netstat", ["-rn", "-f", "inet"])
+        for line in output.split(separator: "\n") {
+            let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            guard parts.count >= 4,
+                  parts[0] == "default",
+                  parts.last == interfaceName,
+                  isPrivateIPv4String(parts[1]) else {
+                continue
+            }
+            return parts[1]
+        }
+        return nil
+    }
+
+    private func isPrivateIPv4String(_ ip: String) -> Bool {
+        let parts = ip.split(separator: ".").compactMap { Int($0) }
+        return isPrivateIPv4(parts)
     }
 
     private func parseARPLine(_ line: String, now: Date, previousDevices: [String: Device]) -> Device? {
@@ -1091,11 +1120,898 @@ final class NetworkMapWindowController: NSWindowController {
 
 }
 
+struct DeviceLocationRadarNode {
+    var id: String
+    var title: String
+    var detail: String
+    var zone: String
+    var confidence: Int
+    var category: String
+    var accent: NSColor
+    var angle: CGFloat
+    var radius: CGFloat
+    var isLeftBehind: Bool
+    var isNew: Bool
+}
+
+final class DeviceLocationLayer {
+    struct Observation {
+        var id: String
+        var name: String
+        var source: String
+        var ip: String?
+        var mac: String?
+        var hostname: String?
+        var rssi: Int?
+        var inferredClass: String
+        var confidenceHint: String
+    }
+
+    private let dbURL: URL
+    private let dateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    var isPaused = false
+    private(set) var lastSnapshotAt: Date?
+    private(set) var lastStateLines: [String] = ["Learning baseline from local snapshots."]
+    private(set) var recentChangeLines: [String] = ["No changes recorded yet."]
+    private(set) var knownPresentCount = 0
+    private(set) var mobilePresentCount = 0
+    private(set) var unknownPresentCount = 0
+    private(set) var leftBehindAlerts: [String] = []
+    private(set) var radarNodes: [DeviceLocationRadarNode] = []
+
+    private var hasSeenBaseline = false
+    private var lastPresentIDs = Set<String>()
+
+    init() {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let folder = support.appendingPathComponent("NetBar", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        dbURL = folder.appendingPathComponent("device-location-layer.sqlite")
+        initializeDatabase()
+    }
+
+    var databaseURL: URL {
+        dbURL
+    }
+
+    var statusText: String {
+        if isPaused {
+            return "paused"
+        }
+        if lastSnapshotAt == nil {
+            return "learning"
+        }
+        return "scanning"
+    }
+
+    func recordSnapshot(devices: [Device], localInfo: LocalAddressInfo, routerIP: String?) {
+        guard !isPaused else { return }
+
+        let now = Date()
+        let snapshotID = Int(now.timeIntervalSince1970 * 1000)
+        let wifi = wifiInfo()
+        var observations = networkObservations(from: devices, routerIP: routerIP)
+        observations.append(contentsOf: bluetoothObservations())
+
+        let currentIDs = Set(observations.map(\.id))
+        let appeared = hasSeenBaseline ? currentIDs.subtracting(lastPresentIDs) : []
+        let disappeared = hasSeenBaseline ? lastPresentIDs.subtracting(currentIDs) : []
+        hasSeenBaseline = true
+        lastPresentIDs = currentIDs
+
+        writeSnapshot(
+            id: snapshotID,
+            date: now,
+            wifi: wifi,
+            localInfo: localInfo,
+            routerIP: routerIP,
+            observations: observations
+        )
+
+        updateState(
+            observations: observations,
+            appeared: appeared,
+            disappeared: disappeared,
+            snapshotID: snapshotID,
+            date: now
+        )
+    }
+
+    func resetBaseline() {
+        sqliteExec("""
+        DELETE FROM observations;
+        DELETE FROM snapshots;
+        DELETE FROM classifications;
+        DELETE FROM clusters;
+        DELETE FROM confidence_scores;
+        DELETE FROM learned_baselines;
+        UPDATE devices SET observation_count = 0;
+        """)
+        lastSnapshotAt = nil
+        lastStateLines = ["Baseline reset. Learning will restart on the next snapshot."]
+        recentChangeLines = ["Baseline reset."]
+        knownPresentCount = 0
+        mobilePresentCount = 0
+        unknownPresentCount = 0
+        leftBehindAlerts = []
+        radarNodes = []
+        hasSeenBaseline = false
+        lastPresentIDs.removeAll()
+    }
+
+    func markDevice(id: String, name: String, classification: String?, ignored: Bool) {
+        let now = dateFormatter.string(from: Date())
+        sqliteExec("""
+        INSERT INTO devices (id, display_name, user_classification, ignored, first_seen, last_seen, observation_count)
+        VALUES (\(sqlValue(id)), \(sqlValue(name)), \(sqlValue(classification)), \(ignored ? 1 : 0), \(sqlValue(now)), \(sqlValue(now)), 0)
+        ON CONFLICT(id) DO UPDATE SET
+            display_name = excluded.display_name,
+            user_classification = excluded.user_classification,
+            ignored = excluded.ignored,
+            last_seen = excluded.last_seen;
+        """)
+    }
+
+    private func initializeDatabase() {
+        sqliteExec("""
+        CREATE TABLE IF NOT EXISTS devices (
+            id TEXT PRIMARY KEY,
+            display_name TEXT,
+            last_ip TEXT,
+            last_mac TEXT,
+            hostname TEXT,
+            manufacturer_hint TEXT,
+            inferred_class TEXT,
+            user_classification TEXT,
+            ignored INTEGER DEFAULT 0,
+            first_seen TEXT,
+            last_seen TEXT,
+            observation_count INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY,
+            captured_at TEXT,
+            wifi_ssid TEXT,
+            wifi_bssid TEXT,
+            wifi_rssi INTEGER,
+            local_ip TEXT,
+            local_interface TEXT,
+            router_ip TEXT
+        );
+        CREATE TABLE IF NOT EXISTS observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id INTEGER,
+            device_id TEXT,
+            source TEXT,
+            present INTEGER,
+            ip TEXT,
+            mac TEXT,
+            hostname TEXT,
+            rssi INTEGER,
+            ping_present INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS clusters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cluster_key TEXT,
+            device_ids TEXT,
+            confidence REAL,
+            updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS classifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT,
+            snapshot_id INTEGER,
+            class TEXT,
+            state TEXT,
+            confidence REAL,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS confidence_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT,
+            snapshot_id INTEGER,
+            presence_score REAL,
+            stability_score REAL,
+            mobility_score REAL,
+            cluster_score REAL,
+            novelty_score REAL,
+            near_mac_score REAL,
+            left_behind_score REAL
+        );
+        CREATE TABLE IF NOT EXISTS learned_baselines (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT
+        );
+        """)
+    }
+
+    private func networkObservations(from devices: [Device], routerIP: String?) -> [Observation] {
+        devices.compactMap { device in
+            let saved = savedClassification(for: device.id)
+            guard !saved.ignored else { return nil }
+            let name = device.hostname?.isEmpty == false ? device.hostname! : "Device \(lastOctet(of: device.ip))"
+            let guess = DeviceClassifier.classify(device: device, name: name)
+            let inferred = saved.classification ?? inferredClass(from: guess.label, ip: device.ip, routerIP: routerIP)
+            return Observation(
+                id: device.id,
+                name: name,
+                source: "arp",
+                ip: device.ip,
+                mac: device.mac,
+                hostname: device.hostname,
+                rssi: nil,
+                inferredClass: inferred,
+                confidenceHint: guess.confidence
+            )
+        }
+    }
+
+    private func savedClassification(for id: String) -> (classification: String?, ignored: Bool) {
+        let output = sqliteOutput("SELECT COALESCE(user_classification, ''), ignored FROM devices WHERE id = \(sqlValue(id));")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let pieces = output.split(separator: "|", omittingEmptySubsequences: false)
+        let classification = pieces.first.map(String.init).flatMap { $0.isEmpty ? nil : $0 }
+        let ignored = pieces.dropFirst().first.map { $0 == "1" } ?? false
+        return (classification, ignored)
+    }
+
+    private func bluetoothObservations() -> [Observation] {
+        let output = run("/usr/sbin/system_profiler", ["SPBluetoothDataType", "-json"])
+        guard let data = output.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) else {
+            return []
+        }
+
+        var observations: [Observation] = []
+        collectBluetoothObjects(json, into: &observations)
+        return observations
+    }
+
+    private func collectBluetoothObjects(_ object: Any, into observations: inout [Observation]) {
+        if let dictionary = object as? [String: Any] {
+            let name = (dictionary["_name"] as? String)
+                ?? (dictionary["device_name"] as? String)
+                ?? (dictionary["name"] as? String)
+            let address = (dictionary["device_address"] as? String)
+                ?? (dictionary["address"] as? String)
+                ?? (dictionary["bt_address"] as? String)
+            let rssiValue = dictionary["device_rssi"] as? Int ?? dictionary["rssi"] as? Int
+
+            if let name, !name.isEmpty {
+                let id = "bt:\((address ?? name).lowercased())"
+                observations.append(
+                    Observation(
+                        id: id,
+                        name: name,
+                        source: "bluetooth",
+                        ip: nil,
+                        mac: address,
+                        hostname: nil,
+                        rssi: rssiValue,
+                        inferredClass: inferredBluetoothClass(from: name),
+                        confidenceHint: rssiValue == nil ? "low" : "medium"
+                    )
+                )
+            }
+
+            for value in dictionary.values {
+                collectBluetoothObjects(value, into: &observations)
+            }
+        } else if let array = object as? [Any] {
+            for value in array {
+                collectBluetoothObjects(value, into: &observations)
+            }
+        }
+    }
+
+    private func wifiInfo() -> (ssid: String?, bssid: String?, rssi: Int?) {
+        let output = run("/usr/sbin/system_profiler", ["SPAirPortDataType", "-json"])
+        guard let data = output.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) else {
+            return (nil, nil, nil)
+        }
+        return findWiFiStatus(in: json)
+    }
+
+    private func findWiFiStatus(in object: Any) -> (ssid: String?, bssid: String?, rssi: Int?) {
+        if let dictionary = object as? [String: Any] {
+            let ssid = dictionary["spairport_current_network_information"] as? String
+                ?? dictionary["spairport_network"] as? String
+                ?? dictionary["ssid"] as? String
+            let bssid = dictionary["spairport_bssid"] as? String
+                ?? dictionary["bssid"] as? String
+            let rssi = dictionary["spairport_signal_noise"] as? Int
+                ?? dictionary["agrCtlRSSI"] as? Int
+                ?? dictionary["rssi"] as? Int
+            if ssid != nil || bssid != nil || rssi != nil {
+                return (ssid, bssid, rssi)
+            }
+            for value in dictionary.values {
+                let found = findWiFiStatus(in: value)
+                if found.ssid != nil || found.bssid != nil || found.rssi != nil {
+                    return found
+                }
+            }
+        } else if let array = object as? [Any] {
+            for value in array {
+                let found = findWiFiStatus(in: value)
+                if found.ssid != nil || found.bssid != nil || found.rssi != nil {
+                    return found
+                }
+            }
+        }
+        return (nil, nil, nil)
+    }
+
+    private func writeSnapshot(id: Int, date: Date, wifi: (ssid: String?, bssid: String?, rssi: Int?), localInfo: LocalAddressInfo, routerIP: String?, observations: [Observation]) {
+        let now = dateFormatter.string(from: date)
+        var sql = """
+        BEGIN TRANSACTION;
+        INSERT INTO snapshots (id, captured_at, wifi_ssid, wifi_bssid, wifi_rssi, local_ip, local_interface, router_ip)
+        VALUES (\(id), \(sqlValue(now)), \(sqlValue(wifi.ssid)), \(sqlValue(wifi.bssid)), \(sqlValue(wifi.rssi)), \(sqlValue(localInfo.ip)), \(sqlValue(localInfo.interfaceName)), \(sqlValue(routerIP)));
+        INSERT INTO learned_baselines (key, value, updated_at)
+        VALUES ('total_snapshots', CAST((SELECT COUNT(*) FROM snapshots) AS TEXT), \(sqlValue(now)))
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;
+        """
+
+        for observation in observations {
+            sql += """
+            INSERT INTO devices (id, display_name, last_ip, last_mac, hostname, manufacturer_hint, inferred_class, first_seen, last_seen, observation_count)
+            VALUES (\(sqlValue(observation.id)), \(sqlValue(observation.name)), \(sqlValue(observation.ip)), \(sqlValue(observation.mac)), \(sqlValue(observation.hostname)), \(sqlValue(observation.confidenceHint)), \(sqlValue(observation.inferredClass)), \(sqlValue(now)), \(sqlValue(now)), 1)
+            ON CONFLICT(id) DO UPDATE SET
+                display_name = excluded.display_name,
+                last_ip = excluded.last_ip,
+                last_mac = excluded.last_mac,
+                hostname = excluded.hostname,
+                manufacturer_hint = excluded.manufacturer_hint,
+                inferred_class = excluded.inferred_class,
+                last_seen = excluded.last_seen,
+                observation_count = observation_count + 1;
+            INSERT INTO observations (snapshot_id, device_id, source, present, ip, mac, hostname, rssi, ping_present)
+            VALUES (\(id), \(sqlValue(observation.id)), \(sqlValue(observation.source)), 1, \(sqlValue(observation.ip)), \(sqlValue(observation.mac)), \(sqlValue(observation.hostname)), \(sqlValue(observation.rssi)), \(observation.source == "arp" ? 1 : 0));
+            """
+        }
+
+        sql += "COMMIT;"
+        sqliteExec(sql)
+    }
+
+    private func updateState(observations: [Observation], appeared: Set<String>, disappeared: Set<String>, snapshotID: Int, date: Date) {
+        let totalSnapshots = max(1, Int(sqliteOutput("SELECT COUNT(*) FROM snapshots;").trimmingCharacters(in: .whitespacesAndNewlines)) ?? 1)
+        var lines: [String] = []
+        var mobileCount = 0
+        var unknownCount = 0
+        var leftBehind: [String] = []
+        var nodes: [DeviceLocationRadarNode] = []
+        let disappearedMobileCount = disappeared.count
+
+        let now = dateFormatter.string(from: date)
+        var scoreSQL = "BEGIN TRANSACTION;"
+
+        for observation in observations {
+            let seenCount = max(1, Int(sqliteOutput("SELECT observation_count FROM devices WHERE id = \(sqlValue(observation.id));").trimmingCharacters(in: .whitespacesAndNewlines)) ?? 1)
+            let stability = min(100, Double(seenCount) / Double(totalSnapshots) * 100)
+            let presence = 100.0
+            let mobility = mobilityScore(for: observation.inferredClass, stability: stability)
+            let novelty = appeared.contains(observation.id) || seenCount <= 2 ? 85.0 : max(0, 100 - stability)
+            let nearMac = observation.source == "bluetooth" ? (observation.rssi == nil ? 65.0 : 80.0) : 45.0
+            let cluster = clusterScore(for: observation, appeared: appeared)
+            let leftBehindScore = leftBehindScore(for: observation, disappearedMobileCount: disappearedMobileCount)
+            let confidence = min(96, max(20, (presence * 0.25) + (stability * 0.25) + (nearMac * 0.2) + ((100 - novelty) * 0.15) + (cluster * 0.15)))
+            let zone = zoneLabel(for: observation)
+            let state = "\(observation.name): \(zone), \(observation.inferredClass), confidence \(Int(confidence.rounded()))%"
+            let isLeftBehind = leftBehindScore >= 60
+
+            if observation.inferredClass == "mobile" || observation.inferredClass == "semi-static" {
+                mobileCount += 1
+            }
+            if observation.inferredClass == "transient" {
+                unknownCount += 1
+            }
+            if isLeftBehind {
+                leftBehind.append("\(observation.name) may be left behind")
+            }
+            lines.append(state)
+            nodes.append(
+                DeviceLocationRadarNode(
+                    id: observation.id,
+                    title: observation.name,
+                    detail: state,
+                    zone: zone,
+                    confidence: Int(confidence.rounded()),
+                    category: observation.inferredClass,
+                    accent: accent(for: observation.inferredClass, source: observation.source),
+                    angle: angle(for: observation.id),
+                    radius: radius(for: observation),
+                    isLeftBehind: isLeftBehind,
+                    isNew: appeared.contains(observation.id)
+                )
+            )
+
+            scoreSQL += """
+            INSERT INTO classifications (device_id, snapshot_id, class, state, confidence, created_at)
+            VALUES (\(sqlValue(observation.id)), \(snapshotID), \(sqlValue(observation.inferredClass)), \(sqlValue(state)), \(confidence), \(sqlValue(now)));
+            INSERT INTO confidence_scores (device_id, snapshot_id, presence_score, stability_score, mobility_score, cluster_score, novelty_score, near_mac_score, left_behind_score)
+            VALUES (\(sqlValue(observation.id)), \(snapshotID), \(presence), \(stability), \(mobility), \(cluster), \(novelty), \(nearMac), \(leftBehindScore));
+            """
+        }
+
+        scoreSQL += "COMMIT;"
+        sqliteExec(scoreSQL)
+
+        var changes: [String] = []
+        if !appeared.isEmpty {
+            changes.append("Appeared: \(names(for: appeared).joined(separator: ", "))")
+        }
+        if !disappeared.isEmpty {
+            changes.append("Disappeared: \(names(for: disappeared).joined(separator: ", "))")
+        }
+        if changes.isEmpty {
+            changes.append("No device presence changes in the last snapshot.")
+        }
+
+        lastSnapshotAt = date
+        lastStateLines = lines.isEmpty ? ["No devices observed in the latest snapshot."] : lines.sorted()
+        recentChangeLines = changes
+        knownPresentCount = observations.count
+        mobilePresentCount = mobileCount
+        unknownPresentCount = unknownCount
+        leftBehindAlerts = leftBehind
+        radarNodes = nodes.sorted { first, second in
+            if first.isLeftBehind != second.isLeftBehind {
+                return first.isLeftBehind
+            }
+            if first.isNew != second.isNew {
+                return first.isNew
+            }
+            return first.title.localizedCaseInsensitiveCompare(second.title) == .orderedAscending
+        }
+    }
+
+    private func names(for ids: Set<String>) -> [String] {
+        ids.map { id in
+            let output = sqliteOutput("SELECT display_name FROM devices WHERE id = \(sqlValue(id));")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return output.isEmpty ? id : output
+        }.sorted()
+    }
+
+    private func inferredClass(from label: String, ip: String, routerIP: String?) -> String {
+        if ip == routerIP || label == "Router" || label == "Printer" || label == "TV / Media" || label == "Smart Home" {
+            return "static"
+        }
+        if label == "Games" || label == "Computer" {
+            return "semi-static"
+        }
+        if label == "Mobile" || label == "Mobile or laptop" {
+            return "mobile"
+        }
+        return "transient"
+    }
+
+    private func inferredBluetoothClass(from name: String) -> String {
+        let lower = name.lowercased()
+        if lower.contains("watch") || lower.contains("phone") || lower.contains("iphone") || lower.contains("airtag") || lower.contains("airpods") || lower.contains("headphone") {
+            return "mobile"
+        }
+        return "transient"
+    }
+
+    private func mobilityScore(for inferredClass: String, stability: Double) -> Double {
+        switch inferredClass {
+        case "static":
+            return max(5, 30 - stability * 0.2)
+        case "semi-static":
+            return max(30, 80 - stability * 0.4)
+        case "mobile":
+            return max(55, 100 - stability * 0.3)
+        default:
+            return max(65, 100 - stability * 0.2)
+        }
+    }
+
+    private func clusterScore(for observation: Observation, appeared: Set<String>) -> Double {
+        guard observation.inferredClass == "mobile" || observation.inferredClass == "transient" else { return 15 }
+        return appeared.count >= 2 && appeared.contains(observation.id) ? 70 : 35
+    }
+
+    private func leftBehindScore(for observation: Observation, disappearedMobileCount: Int) -> Double {
+        guard observation.inferredClass == "mobile" || observation.inferredClass == "transient" else { return 0 }
+        return disappearedMobileCount >= 2 ? 62 : 0
+    }
+
+    private func zoneLabel(for observation: Observation) -> String {
+        if observation.source == "bluetooth" {
+            return "Bluetooth nearby"
+        }
+        if observation.source == "arp" {
+            return "Home network present"
+        }
+        return "Unknown"
+    }
+
+    private func accent(for inferredClass: String, source: String) -> NSColor {
+        if source == "bluetooth" {
+            return .systemPurple
+        }
+        switch inferredClass {
+        case "static":
+            return .systemBlue
+        case "semi-static":
+            return .systemTeal
+        case "mobile":
+            return .systemIndigo
+        default:
+            return .systemOrange
+        }
+    }
+
+    private func angle(for id: String) -> CGFloat {
+        let total = id.unicodeScalars.reduce(0) { partial, scalar in
+            partial + Int(scalar.value)
+        }
+        return CGFloat(total % 360) * .pi / 180
+    }
+
+    private func radius(for observation: Observation) -> CGFloat {
+        if observation.source == "bluetooth" {
+            return 0.36
+        }
+        switch observation.inferredClass {
+        case "static":
+            return 0.76
+        case "semi-static":
+            return 0.62
+        case "mobile":
+            return 0.50
+        default:
+            return 0.84
+        }
+    }
+
+    private func lastOctet(of ip: String) -> String {
+        ip.split(separator: ".").last.map { ".\($0)" } ?? ip
+    }
+
+    private func sqliteExec(_ sql: String) {
+        _ = runSQLite(sql)
+    }
+
+    private func sqliteOutput(_ sql: String) -> String {
+        runSQLite(sql, output: true)
+    }
+
+    private func runSQLite(_ sql: String, output: Bool = false) -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        process.arguments = output
+            ? ["-batch", "-noheader", dbURL.path, sql]
+            : ["-batch", dbURL.path, sql]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+        } catch {
+            return ""
+        }
+
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private func sqlValue(_ value: String?) -> String {
+        guard let value else { return "NULL" }
+        return "'\(value.replacingOccurrences(of: "'", with: "''"))'"
+    }
+
+    private func sqlValue(_ value: Int?) -> String {
+        guard let value else { return "NULL" }
+        return "\(value)"
+    }
+
+    private func run(_ launchPath: String, _ arguments: [String]) -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: launchPath)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        let semaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            semaphore.signal()
+        }
+
+        do {
+            try process.run()
+        } catch {
+            return ""
+        }
+
+        if semaphore.wait(timeout: .now() + 5) == .timedOut {
+            process.terminate()
+            return ""
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+}
+
+final class DeviceLocationRadarView: NSView {
+    var nodes: [DeviceLocationRadarNode] = []
+    var statusText = "learning"
+    var summaryText = "No snapshots yet."
+    var lastSnapshotText = "never"
+    var recentChanges: [String] = []
+    var leftBehindAlerts: [String] = []
+
+    private var sweepAngle: CGFloat = 0
+    private var animationTimer: Timer?
+
+    override var isFlipped: Bool {
+        true
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            animationTimer?.invalidate()
+            animationTimer = nil
+        } else if animationTimer == nil {
+            animationTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 24.0, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.sweepAngle = (self.sweepAngle + 0.035).truncatingRemainder(dividingBy: .pi * 2)
+                self.needsDisplay = true
+            }
+        }
+    }
+
+    func updateFromLayer(_ layer: DeviceLocationLayer, formattedSnapshot: String) {
+        nodes = layer.radarNodes
+        statusText = layer.statusText
+        summaryText = "\(layer.knownPresentCount) present - \(layer.mobilePresentCount) mobile - \(layer.unknownPresentCount) unknown"
+        lastSnapshotText = formattedSnapshot
+        recentChanges = Array(layer.recentChangeLines.prefix(4))
+        leftBehindAlerts = Array(layer.leftBehindAlerts.prefix(4))
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.windowBackgroundColor.setFill()
+        bounds.fill()
+
+        let leftWidth = min(bounds.width * 0.58, bounds.width - 300)
+        let radarRect = NSRect(x: 28, y: 76, width: leftWidth - 44, height: bounds.height - 114)
+        let panelRect = NSRect(x: radarRect.maxX + 24, y: 76, width: bounds.maxX - radarRect.maxX - 52, height: bounds.height - 114)
+
+        drawHeader()
+        drawRadar(in: radarRect)
+        drawStatePanel(in: panelRect)
+    }
+
+    private func drawHeader() {
+        drawText("Device Location Layer", in: NSRect(x: 28, y: 22, width: 360, height: 28), font: .systemFont(ofSize: 24, weight: .bold), color: .labelColor)
+        drawText("Status: \(statusText) - \(summaryText) - last snapshot \(lastSnapshotText)", in: NSRect(x: 30, y: 52, width: bounds.width - 60, height: 18), font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
+    }
+
+    private func drawRadar(in rect: NSRect) {
+        let size = min(rect.width, rect.height)
+        let radarBounds = NSRect(x: rect.midX - size / 2, y: rect.midY - size / 2, width: size, height: size)
+        let center = NSPoint(x: radarBounds.midX, y: radarBounds.midY)
+        let radius = size / 2 - 18
+
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.16)
+        shadow.shadowBlurRadius = 14
+        shadow.shadowOffset = NSSize(width: 0, height: -2)
+        shadow.set()
+        NSColor.controlBackgroundColor.setFill()
+        NSBezierPath(ovalIn: radarBounds).fill()
+        NSGraphicsContext.restoreGraphicsState()
+
+        NSColor.systemGreen.withAlphaComponent(0.09).setFill()
+        NSBezierPath(ovalIn: radarBounds.insetBy(dx: 10, dy: 10)).fill()
+
+        for fraction in [0.25, 0.5, 0.75, 1.0] {
+            let ringRadius = radius * CGFloat(fraction)
+            let ring = NSRect(x: center.x - ringRadius, y: center.y - ringRadius, width: ringRadius * 2, height: ringRadius * 2)
+            NSColor.systemGreen.withAlphaComponent(0.18).setStroke()
+            let path = NSBezierPath(ovalIn: ring)
+            path.lineWidth = 1
+            path.stroke()
+        }
+
+        drawCrosshair(center: center, radius: radius)
+        drawSweep(center: center, radius: radius)
+        drawZoneLabels(center: center, radius: radius)
+        drawCenterMac(center: center)
+
+        for node in nodes.prefix(28) {
+            drawRadarNode(node, center: center, radius: radius)
+        }
+
+        if nodes.isEmpty {
+            drawText("Learning from snapshots", in: NSRect(x: radarBounds.midX - 110, y: radarBounds.midY + 36, width: 220, height: 20), font: .systemFont(ofSize: 13, weight: .medium), color: .secondaryLabelColor, alignment: .center)
+        }
+    }
+
+    private func drawCrosshair(center: NSPoint, radius: CGFloat) {
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: center.x - radius, y: center.y))
+        path.line(to: NSPoint(x: center.x + radius, y: center.y))
+        path.move(to: NSPoint(x: center.x, y: center.y - radius))
+        path.line(to: NSPoint(x: center.x, y: center.y + radius))
+        NSColor.systemGreen.withAlphaComponent(0.16).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+    }
+
+    private func drawSweep(center: NSPoint, radius: CGFloat) {
+        let path = NSBezierPath()
+        path.move(to: center)
+        path.appendArc(withCenter: center, radius: radius, startAngle: degrees(sweepAngle - 0.35), endAngle: degrees(sweepAngle), clockwise: false)
+        path.close()
+        NSColor.systemGreen.withAlphaComponent(0.20).setFill()
+        path.fill()
+
+        let line = NSBezierPath()
+        line.move(to: center)
+        line.line(to: NSPoint(x: center.x + cos(sweepAngle) * radius, y: center.y + sin(sweepAngle) * radius))
+        NSColor.systemGreen.withAlphaComponent(0.75).setStroke()
+        line.lineWidth = 2
+        line.stroke()
+    }
+
+    private func drawZoneLabels(center: NSPoint, radius: CGFloat) {
+        drawText("Near Mac", in: NSRect(x: center.x - 46, y: center.y - radius * 0.34, width: 92, height: 18), font: .systemFont(ofSize: 11, weight: .medium), color: .secondaryLabelColor, alignment: .center)
+        drawText("Home network", in: NSRect(x: center.x - 56, y: center.y - radius * 0.74, width: 112, height: 18), font: .systemFont(ofSize: 11, weight: .medium), color: .secondaryLabelColor, alignment: .center)
+        drawText("Router / fixed edge", in: NSRect(x: center.x - 70, y: center.y + radius * 0.78, width: 140, height: 18), font: .systemFont(ofSize: 11, weight: .medium), color: .secondaryLabelColor, alignment: .center)
+    }
+
+    private func drawCenterMac(center: NSPoint) {
+        let macRect = NSRect(x: center.x - 34, y: center.y - 34, width: 68, height: 68)
+        NSColor.systemGreen.withAlphaComponent(0.24).setFill()
+        NSBezierPath(ovalIn: macRect).fill()
+        NSColor.systemGreen.withAlphaComponent(0.85).setStroke()
+        let path = NSBezierPath(ovalIn: macRect)
+        path.lineWidth = 2
+        path.stroke()
+        drawText("Mac", in: macRect.insetBy(dx: 6, dy: 24), font: .systemFont(ofSize: 13, weight: .bold), color: .labelColor, alignment: .center)
+    }
+
+    private func drawRadarNode(_ node: DeviceLocationRadarNode, center: NSPoint, radius: CGFloat) {
+        let pointRadius = radius * node.radius
+        let position = NSPoint(x: center.x + cos(node.angle) * pointRadius, y: center.y + sin(node.angle) * pointRadius)
+        let dotSize: CGFloat = node.isLeftBehind ? 16 : (node.isNew ? 14 : 11)
+        let dotRect = NSRect(x: position.x - dotSize / 2, y: position.y - dotSize / 2, width: dotSize, height: dotSize)
+
+        node.accent.withAlphaComponent(node.isLeftBehind ? 0.95 : 0.82).setFill()
+        NSBezierPath(ovalIn: dotRect).fill()
+        NSColor.controlBackgroundColor.withAlphaComponent(0.9).setStroke()
+        let outline = NSBezierPath(ovalIn: dotRect)
+        outline.lineWidth = node.isLeftBehind ? 2.4 : 1.5
+        outline.stroke()
+
+        if node.isLeftBehind {
+            drawText("!", in: dotRect.insetBy(dx: 2, dy: 0), font: .systemFont(ofSize: 11, weight: .bold), color: .white, alignment: .center)
+        }
+
+        let label = compactLabel(node.title)
+        drawText(label, in: NSRect(x: position.x - 48, y: position.y + dotSize / 2 + 4, width: 96, height: 16), font: .systemFont(ofSize: 10, weight: .medium), color: .secondaryLabelColor, alignment: .center)
+    }
+
+    private func drawStatePanel(in rect: NSRect) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
+        NSColor.controlBackgroundColor.setFill()
+        path.fill()
+        NSColor.separatorColor.withAlphaComponent(0.8).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+
+        var y = rect.minY + 18
+        drawText("Likely State", in: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: 22), font: .systemFont(ofSize: 16, weight: .semibold), color: .labelColor)
+        y += 30
+
+        if !leftBehindAlerts.isEmpty {
+            drawText("Possible Left Behind", in: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: 18), font: .systemFont(ofSize: 12, weight: .semibold), color: .systemOrange)
+            y += 22
+            for alert in leftBehindAlerts {
+                y = drawWrapped(alert, x: rect.minX + 18, y: y, width: rect.width - 36, color: .labelColor)
+            }
+            y += 8
+        }
+
+        drawText("Recent Changes", in: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: 18), font: .systemFont(ofSize: 12, weight: .semibold), color: .secondaryLabelColor)
+        y += 22
+        for change in recentChanges.prefix(4) {
+            y = drawWrapped(change, x: rect.minX + 18, y: y, width: rect.width - 36, color: .labelColor)
+        }
+
+        y += 12
+        drawText("Devices", in: NSRect(x: rect.minX + 18, y: y, width: rect.width - 36, height: 18), font: .systemFont(ofSize: 12, weight: .semibold), color: .secondaryLabelColor)
+        y += 22
+        for node in nodes.prefix(10) {
+            let markerRect = NSRect(x: rect.minX + 18, y: y + 4, width: 8, height: 8)
+            node.accent.setFill()
+            NSBezierPath(ovalIn: markerRect).fill()
+            let text = "\(node.title) - \(node.zone), \(node.confidence)%"
+            y = drawWrapped(text, x: rect.minX + 34, y: y, width: rect.width - 52, color: node.isLeftBehind ? .systemOrange : .labelColor)
+        }
+    }
+
+    private func drawWrapped(_ text: String, x: CGFloat, y: CGFloat, width: CGFloat, color: NSColor) -> CGFloat {
+        let rect = NSRect(x: x, y: y, width: width, height: 34)
+        drawText(text, in: rect, font: .systemFont(ofSize: 12), color: color)
+        return y + 36
+    }
+
+    private func drawText(_ text: String, in rect: NSRect, font: NSFont, color: NSColor, alignment: NSTextAlignment = .left) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingTail
+        paragraph.alignment = alignment
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: color,
+            .paragraphStyle: paragraph
+        ]
+        (text as NSString).draw(in: rect, withAttributes: attributes)
+    }
+
+    private func compactLabel(_ value: String) -> String {
+        if value.count <= 14 {
+            return value
+        }
+        return String(value.prefix(13)) + "..."
+    }
+
+    private func degrees(_ radians: CGFloat) -> CGFloat {
+        radians * 180 / .pi
+    }
+}
+
+final class DeviceLocationWindowController: NSWindowController {
+    private let radarView = DeviceLocationRadarView(frame: NSRect(x: 0, y: 0, width: 900, height: 620))
+
+    init() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 620),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "NetBar Device Location Layer"
+        window.isReleasedWhenClosed = false
+        window.center()
+        radarView.autoresizingMask = [.width, .height]
+        window.contentView = radarView
+        super.init(window: window)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func update(layer: DeviceLocationLayer, formattedSnapshot: String) {
+        radarView.updateFromLayer(layer, formattedSnapshot: formattedSnapshot)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let scanner = NetworkScanner()
     private let store = StateStore()
     private let startupManager = StartupManager()
+    private let locationLayer = DeviceLocationLayer()
     private let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.timeStyle = .medium
@@ -1115,6 +2031,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sharingPicker: NSSharingServicePicker?
     private var settingsWindowController: SettingsWindowController?
     private var networkMapWindowController: NetworkMapWindowController?
+    private var deviceLocationWindowController: DeviceLocationWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -1148,10 +2065,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let previousDevices = devicesByID
         let previousIDs = Set(previousDevices.keys)
         let scanner = self.scanner
+        let locationLayer = self.locationLayer
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let localInfo = scanner.localAddressInfo()
             let devices = scanner.scan(previousDevices: previousDevices, localInfo: localInfo, activeLookup: true)
+            let routerIP = scanner.gatewayIPAddress(localInfo: localInfo)
+            locationLayer.recordSnapshot(devices: devices, localInfo: localInfo, routerIP: routerIP)
             let now = Date()
 
             DispatchQueue.main.async {
@@ -1182,6 +2102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isRefreshing = false
         rebuildMenu()
         updateNetworkMap()
+        updateDeviceLocationWindow()
     }
 
     private func rebuildMenu() {
@@ -1237,6 +2158,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         networkMap.target = self
         menu.addItem(networkMap)
 
+        addLocationLayerItems(to: menu)
+
         let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refresh(_:)), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
@@ -1260,6 +2183,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quit)
 
         statusItem.menu = menu
+    }
+
+    private func addLocationLayerItems(to menu: NSMenu) {
+        menu.addItem(.separator())
+
+        let title = NSMenuItem(title: "Device Location Layer", action: nil, keyEquivalent: "")
+        title.isEnabled = false
+        menu.addItem(title)
+
+        addDisabled("Status: \(locationLayer.statusText)", to: menu)
+        addDisabled("Present: \(locationLayer.knownPresentCount) known, \(locationLayer.mobilePresentCount) mobile, \(locationLayer.unknownPresentCount) unknown", to: menu)
+        if locationLayer.leftBehindAlerts.isEmpty {
+            addDisabled("Left-behind alerts: none", to: menu)
+        } else {
+            addDisabled("Left-behind alerts: \(locationLayer.leftBehindAlerts.count)", to: menu)
+        }
+        let snapshotText = locationLayer.lastSnapshotAt.map { timeFormatter.string(from: $0) } ?? "never"
+        addDisabled("Last snapshot: \(snapshotText)", to: menu)
+
+        let pauseTitle = locationLayer.isPaused ? "Start Scanning" : "Pause Scanning"
+        let pause = NSMenuItem(title: pauseTitle, action: #selector(toggleLocationLayer(_:)), keyEquivalent: "")
+        pause.target = self
+        menu.addItem(pause)
+
+        let snapshot = NSMenuItem(title: "Take Snapshot Now", action: #selector(takeLocationSnapshot(_:)), keyEquivalent: "")
+        snapshot.target = self
+        menu.addItem(snapshot)
+
+        let state = NSMenuItem(title: "Show Device State...", action: #selector(showDeviceState(_:)), keyEquivalent: "")
+        state.target = self
+        menu.addItem(state)
+
+        let changes = NSMenuItem(title: "Show Recent Changes...", action: #selector(showRecentChanges(_:)), keyEquivalent: "")
+        changes.target = self
+        menu.addItem(changes)
+
+        let export = NSMenuItem(title: "Export Logs...", action: #selector(exportLocationLogs(_:)), keyEquivalent: "")
+        export.target = self
+        menu.addItem(export)
+
+        let reset = NSMenuItem(title: "Reset Learned Baseline...", action: #selector(resetLocationBaseline(_:)), keyEquivalent: "")
+        reset.target = self
+        menu.addItem(reset)
     }
 
     private func menuItem(for device: Device) -> NSMenuItem {
@@ -1298,6 +2264,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         clearName.representedObject = device.id
         clearName.isEnabled = store.state.aliases[device.id] != nil
         submenu.addItem(clearName)
+
+        submenu.addItem(.separator())
+
+        let markStatic = NSMenuItem(title: "Location: Mark Static", action: #selector(markLocationDevice(_:)), keyEquivalent: "")
+        markStatic.target = self
+        markStatic.representedObject = ["id": device.id, "class": "static"]
+        submenu.addItem(markStatic)
+
+        let markMobile = NSMenuItem(title: "Location: Mark Mobile", action: #selector(markLocationDevice(_:)), keyEquivalent: "")
+        markMobile.target = self
+        markMobile.representedObject = ["id": device.id, "class": "mobile"]
+        submenu.addItem(markMobile)
+
+        let ignoreLocation = NSMenuItem(title: "Location: Ignore", action: #selector(markLocationDevice(_:)), keyEquivalent: "")
+        ignoreLocation.target = self
+        ignoreLocation.representedObject = ["id": device.id, "class": "ignored"]
+        submenu.addItem(ignoreLocation)
 
         submenu.addItem(.separator())
 
@@ -1404,10 +2387,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         networkMapWindowController?.update(
             devices: devices,
             localInfo: localInfo,
-            gatewayIP: scanner.gatewayIPAddress(),
+            gatewayIP: scanner.gatewayIPAddress(localInfo: localInfo),
             lastRefresh: lastRefresh,
             newDeviceIDs: Set(newDeviceHighlights.keys)
         )
+    }
+
+    @objc private func toggleLocationLayer(_ sender: NSMenuItem) {
+        locationLayer.isPaused.toggle()
+        rebuildMenu()
+        if !locationLayer.isPaused {
+            refresh(nil)
+        }
+    }
+
+    @objc private func takeLocationSnapshot(_ sender: NSMenuItem) {
+        refresh(nil)
+    }
+
+    @objc private func showDeviceState(_ sender: NSMenuItem) {
+        NSApp.activate(ignoringOtherApps: true)
+        if deviceLocationWindowController == nil {
+            deviceLocationWindowController = DeviceLocationWindowController()
+        }
+        updateDeviceLocationWindow()
+        deviceLocationWindowController?.showWindow(nil)
+    }
+
+    @objc private func showRecentChanges(_ sender: NSMenuItem) {
+        var lines = locationLayer.recentChangeLines
+        if !locationLayer.leftBehindAlerts.isEmpty {
+            lines.append("")
+            lines.append("Possible left-behind alerts:")
+            lines.append(contentsOf: locationLayer.leftBehindAlerts)
+        }
+        showTextPanel(title: "Recent Device Changes", message: lines.joined(separator: "\n"))
+    }
+
+    @objc private func exportLocationLogs(_ sender: NSMenuItem) {
+        NSWorkspace.shared.activateFileViewerSelecting([locationLayer.databaseURL])
+    }
+
+    @objc private func resetLocationBaseline(_ sender: NSMenuItem) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Reset learned baseline?"
+        alert.informativeText = "This clears snapshots, observations, clusters, and confidence scores. Device labels and NetBar settings are kept."
+        alert.addButton(withTitle: "Reset")
+        alert.addButton(withTitle: "Cancel")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            locationLayer.resetBaseline()
+            rebuildMenu()
+            updateDeviceLocationWindow()
+        }
+    }
+
+    private func updateDeviceLocationWindow() {
+        let snapshot = locationLayer.lastSnapshotAt.map { timeFormatter.string(from: $0) } ?? "never"
+        deviceLocationWindowController?.update(layer: locationLayer, formattedSnapshot: snapshot)
+    }
+
+    private func showTextPanel(title: String, message: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = title
+        alert.informativeText = message.isEmpty ? "No data yet." : message
+        alert.addButton(withTitle: "Done")
+        alert.runModal()
     }
 
     @objc private func renameDevice(_ sender: NSMenuItem) {
@@ -1436,6 +2485,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let deviceID = sender.representedObject as? String else { return }
         store.setAlias(nil, for: deviceID)
         rebuildMenu()
+    }
+
+    @objc private func markLocationDevice(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? [String: String],
+              let deviceID = payload["id"],
+              let device = devicesByID[deviceID] else { return }
+
+        let label = displayName(for: device)
+        let classification = payload["class"]
+        if classification == "ignored" {
+            locationLayer.markDevice(id: deviceID, name: label, classification: nil, ignored: true)
+        } else {
+            locationLayer.markDevice(id: deviceID, name: label, classification: classification, ignored: false)
+        }
+        refresh(nil)
     }
 
     @objc private func copyIP(_ sender: NSMenuItem) {
@@ -1599,6 +2663,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         \(macLine)
 
         NetBar briefly probes this Mac's private/local subnet, reads the macOS ARP table, highlights newly discovered devices, and can ping a selected IP 6 times for an average.
+
+        Device Location Layer: \(locationLayer.statusText)
+        Location snapshots: local SQLite only
+
+        The location layer learns likely static, mobile, transient, new, and left-behind states from repeated local snapshots. It reports confidence zones, not exact coordinates.
 
         Network data stays local. NetBar does not upload analytics or contact a remote service.
 

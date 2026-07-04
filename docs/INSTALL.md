@@ -67,6 +67,18 @@ NetBar uses the first scan after launch as its baseline. Devices that appear aft
 
 On refresh, NetBar briefly probes the private/local IPv4 subnet for this Mac's active LAN address. That network access helps macOS populate the ARP table, which makes the device list and Network Map more complete.
 
+## Device Location Layer
+
+NetBar starts the Device Location Layer from launch and refreshes it with the normal background scan. Open `Device Location Layer` from the Menu Bar menu to see the radar-style confidence view.
+
+The layer stores snapshots locally in:
+
+```text
+~/Library/Application Support/NetBar/device-location-layer.sqlite
+```
+
+From a device submenu you can mark a device as static, mobile, or ignored for the location model. Use `Reset Learned Baseline...` if you want NetBar to forget the snapshot history and start learning again.
+
 ## Ping a Device
 
 Open a device submenu and choose `Ping IP (6 avg)`. NetBar sends 6 pings and reports the average response time. If no reply arrives within 6 seconds, the result is shown as a bad ping.
