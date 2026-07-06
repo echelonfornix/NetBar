@@ -8,6 +8,7 @@ struct Device: Codable {
     var interfaceName: String
     var hostname: String?
     var isPermanent: Bool
+    var isReachable: Bool
     var firstSeen: Date
     var lastSeen: Date
 
@@ -70,11 +71,15 @@ struct DevicePresenceRecord: Codable {
     var firstSeen: Date
     var lastSeen: Date?
     var lastDisappearedAt: Date?
+    var lastReachableAt: Date?
+    var lastUnreachableAt: Date?
     var seenCount: Int
     var absenceCount: Int
+    var reachableMissCount: Int?
     var normalSince: Date?
     var restartMarkedUntil: Date?
     var isPresent: Bool
+    var wasReachable: Bool?
 }
 
 struct DevicePresenceStatus {
@@ -85,6 +90,7 @@ struct DevicePresenceStatus {
     var seenCount: Int
     var isNewToNetwork: Bool
     var isRestartMarked: Bool
+    var isUnreachable: Bool
     var isNormal: Bool
 }
 
@@ -341,22 +347,48 @@ final class StateStore {
                 firstSeen: now,
                 lastSeen: nil,
                 lastDisappearedAt: nil,
+                lastReachableAt: nil,
+                lastUnreachableAt: nil,
                 seenCount: 0,
                 absenceCount: 0,
+                reachableMissCount: nil,
                 normalSince: nil,
                 restartMarkedUntil: nil,
-                isPresent: false
+                isPresent: false,
+                wasReachable: nil
             )
 
             let wasKnown = state.networkPresence[device.id] != nil
             let wasMissing = wasKnown && !record.isPresent
             let disappearedRecently = record.lastDisappearedAt.map { now.timeIntervalSince($0) <= restartWindow } ?? false
             let wasEstablished = record.normalSince != nil || record.seenCount >= normalSeenThreshold
-            let isRestart = wasMissing && disappearedRecently && wasEstablished
+            let hadReachableHistory = record.lastReachableAt != nil || record.wasReachable == true
+            let wasReachable = record.wasReachable ?? false
+            let returnedAfterProbeMiss = device.isReachable
+                && hadReachableHistory
+                && !wasReachable
+                && (record.lastUnreachableAt.map { now.timeIntervalSince($0) <= restartWindow } ?? false)
+            let isRestart = ((wasMissing && disappearedRecently) || returnedAfterProbeMiss) && wasEstablished
 
             record.seenCount += 1
             record.lastSeen = now
-            record.isPresent = true
+            if device.isReachable {
+                record.lastReachableAt = now
+                record.reachableMissCount = 0
+                record.wasReachable = true
+                record.isPresent = true
+            } else if hadReachableHistory {
+                record.lastUnreachableAt = now
+                record.reachableMissCount = (record.reachableMissCount ?? 0) + 1
+                record.wasReachable = false
+                if record.isPresent {
+                    record.lastDisappearedAt = now
+                    record.absenceCount += 1
+                }
+                record.isPresent = false
+            } else {
+                record.isPresent = true
+            }
             if record.seenCount >= normalSeenThreshold, record.normalSince == nil {
                 record.normalSince = now
             }
@@ -376,6 +408,11 @@ final class StateStore {
                 record.isPresent = false
                 record.lastDisappearedAt = now
                 record.absenceCount += 1
+            }
+            if record.lastReachableAt != nil || record.wasReachable == true {
+                record.lastUnreachableAt = now
+                record.reachableMissCount = (record.reachableMissCount ?? 0) + 1
+                record.wasReachable = false
             }
             if let restartMarkedUntil = record.restartMarkedUntil, restartMarkedUntil < now {
                 record.restartMarkedUntil = nil
@@ -570,6 +607,21 @@ final class StateStore {
                 seenCount: record.seenCount,
                 isNewToNetwork: false,
                 isRestartMarked: true,
+                isUnreachable: false,
+                isNormal: false
+            )
+        }
+
+        if record.lastReachableAt != nil, record.wasReachable == false {
+            return DevicePresenceStatus(
+                title: "Known device not answering",
+                detail: "It may be powered off. If it answers again soon, NetBar will mark it as RESTART.",
+                badge: "OFF?",
+                firstSeen: record.firstSeen,
+                seenCount: record.seenCount,
+                isNewToNetwork: false,
+                isRestartMarked: false,
+                isUnreachable: true,
                 isNormal: false
             )
         }
@@ -583,6 +635,7 @@ final class StateStore {
                 seenCount: record.seenCount,
                 isNewToNetwork: false,
                 isRestartMarked: false,
+                isUnreachable: false,
                 isNormal: true
             )
         }
@@ -595,6 +648,7 @@ final class StateStore {
             seenCount: record.seenCount,
             isNewToNetwork: true,
             isRestartMarked: false,
+            isUnreachable: false,
             isNormal: false
         )
     }
@@ -630,39 +684,44 @@ final class StateStore {
 
 final class NetworkScanner {
     func scan(previousDevices: [String: Device], localInfo: LocalAddressInfo, activeLookup: Bool = true) -> [Device] {
-        if activeLookup {
-            probeLocalSubnet(from: localInfo.ip)
-        }
+        let reachableIPs = activeLookup ? probeLocalSubnet(from: localInfo.ip) : []
 
         let now = Date()
         let output = run("/usr/sbin/arp", ["-a"])
         let devices = output
             .split(separator: "\n")
-            .compactMap { parseARPLine(String($0), now: now, previousDevices: previousDevices) }
+            .compactMap { parseARPLine(String($0), now: now, previousDevices: previousDevices, reachableIPs: reachableIPs) }
 
         return devices.sorted { lhs, rhs in
             compareIPv4(lhs.ip, rhs.ip)
         }
     }
 
-    private func probeLocalSubnet(from localIP: String?) {
-        guard let targets = localSubnetTargets(from: localIP), !targets.isEmpty else { return }
+    private func probeLocalSubnet(from localIP: String?) -> Set<String> {
+        guard let targets = localSubnetTargets(from: localIP), !targets.isEmpty else { return [] }
 
         let queue = DispatchQueue(label: "netbar.local-lookup", attributes: .concurrent)
         let group = DispatchGroup()
         let limit = DispatchSemaphore(value: 32)
+        let lock = NSLock()
+        var reachableIPs = Set<String>()
 
         for target in targets {
             limit.wait()
             group.enter()
             queue.async {
-                self.runPingProbe(target)
+                if self.runPingProbe(target) {
+                    lock.lock()
+                    reachableIPs.insert(target)
+                    lock.unlock()
+                }
                 limit.signal()
                 group.leave()
             }
         }
 
         _ = group.wait(timeout: .now() + 6)
+        return reachableIPs
     }
 
     private func localSubnetTargets(from localIP: String?) -> [String]? {
@@ -684,7 +743,7 @@ final class NetworkScanner {
             || (parts[0] == 169 && parts[1] == 254)
     }
 
-    private func runPingProbe(_ ip: String) {
+    private func runPingProbe(_ ip: String) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/sbin/ping")
         process.arguments = ["-c", "1", "-W", "350", ip]
@@ -695,8 +754,9 @@ final class NetworkScanner {
             try process.run()
             process.waitUntilExit()
         } catch {
-            return
+            return false
         }
+        return process.terminationStatus == 0
     }
 
     func localAddressInfo() -> LocalAddressInfo {
@@ -774,7 +834,7 @@ final class NetworkScanner {
         return isPrivateIPv4(parts)
     }
 
-    private func parseARPLine(_ line: String, now: Date, previousDevices: [String: Device]) -> Device? {
+    private func parseARPLine(_ line: String, now: Date, previousDevices: [String: Device], reachableIPs: Set<String>) -> Device? {
         guard let ipRange = line.range(of: #"\((\d{1,3}(?:\.\d{1,3}){3})\)"#, options: .regularExpression) else {
             return nil
         }
@@ -812,6 +872,7 @@ final class NetworkScanner {
             interfaceName: interfaceName,
             hostname: hostname,
             isPermanent: line.contains(" permanent"),
+            isReachable: reachableIPs.contains(ip),
             firstSeen: previous?.firstSeen ?? now,
             lastSeen: now
         )
@@ -1275,7 +1336,7 @@ final class NetworkMapView: NSView {
         shadow.set()
 
         let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
-        if node.isNew || node.statusBadge == "RESTART" {
+        if node.isNew || node.statusBadge == "RESTART" || node.statusBadge == "OFF?" {
             (node.statusColor ?? node.accent).withAlphaComponent(0.08).setFill()
         } else {
             NSColor.controlBackgroundColor.setFill()
@@ -1287,7 +1348,7 @@ final class NetworkMapView: NSView {
         NSBezierPath(roundedRect: NSRect(x: rect.minX, y: rect.minY, width: 7, height: rect.height), xRadius: 4, yRadius: 4).fill()
 
         let highlightColor = node.statusColor ?? node.accent
-        let isHighlighted = node.isNew || node.statusBadge == "RESTART"
+        let isHighlighted = node.isNew || node.statusBadge == "RESTART" || node.statusBadge == "OFF?"
         (isHighlighted ? highlightColor : NSColor.separatorColor).withAlphaComponent(isHighlighted ? 0.95 : 0.8).setStroke()
         path.lineWidth = isHighlighted ? 2.2 : 1
         path.stroke()
@@ -1437,9 +1498,11 @@ final class NetworkMapWindowController: NSWindowController {
         let refreshed = lastRefresh.map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) } ?? "never"
         let newCount = mapView.deviceNodes.filter(\.isNew).count
         let restartCount = mapView.deviceNodes.filter { $0.statusBadge == "RESTART" }.count
+        let offCount = mapView.deviceNodes.filter { $0.statusBadge == "OFF?" }.count
         let statusParts = [
             newCount > 0 ? "\(newCount) new" : nil,
-            restartCount > 0 ? "\(restartCount) restarted" : nil
+            restartCount > 0 ? "\(restartCount) restarted" : nil,
+            offCount > 0 ? "\(offCount) off?" : nil
         ].compactMap { $0 }
         let statusText = statusParts.isEmpty ? "" : " - \(statusParts.joined(separator: ", "))"
         mapView.footerText = "\(mapView.deviceNodes.count) devices below this Mac\(statusText) - refreshed \(refreshed)"
@@ -1482,6 +1545,9 @@ final class NetworkMapWindowController: NSWindowController {
         if presence?.isRestartMarked == true {
             statusBadge = "RESTART"
             statusColor = .systemOrange
+        } else if presence?.isUnreachable == true {
+            statusBadge = "OFF?"
+            statusColor = .systemGray
         } else if presence?.isNewToNetwork == true {
             statusBadge = "NEW"
             statusColor = accent ?? classification.accent
@@ -2742,6 +2808,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastRefresh: Date?
     private var isRefreshing = false
     private var timer: Timer?
+    private var huntTimer: Timer?
+    private var huntUntil: Date?
     private var startupError: String?
     private var sharingPicker: NSSharingServicePicker?
     private var settingsWindowController: SettingsWindowController?
@@ -2839,9 +2907,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let refreshed = lastRefresh.map { timeFormatter.string(from: $0) } ?? "Never"
         let newCount = devices.filter { presenceStatus(for: $0).isNewToNetwork }.count
         let restartCount = devices.filter { presenceStatus(for: $0).isRestartMarked }.count
+        let offCount = devices.filter { presenceStatus(for: $0).isUnreachable }.count
         let statusParts = [
             newCount > 0 ? "\(newCount) new" : nil,
-            restartCount > 0 ? "\(restartCount) restarted" : nil
+            restartCount > 0 ? "\(restartCount) restarted" : nil,
+            offCount > 0 ? "\(offCount) off?" : nil,
+            isHuntDeviceActive ? "hunt active" : nil
         ].compactMap { $0 }
         let statusSummary = statusParts.isEmpty ? "" : " - \(statusParts.joined(separator: ", "))"
         let summaryTitle = isRefreshing
@@ -2892,6 +2963,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(radar)
 
         addLocationLayerItems(to: menu)
+
+        if isHuntDeviceActive, let huntUntil {
+            addDisabled("Hunt Device: scanning until \(timeFormatter.string(from: huntUntil))", to: menu)
+        }
+
+        let huntTitle = isHuntDeviceActive ? "Stop Hunt Device" : "Hunt Device..."
+        let hunt = NSMenuItem(title: huntTitle, action: #selector(toggleHuntDevice(_:)), keyEquivalent: "h")
+        hunt.target = self
+        menu.addItem(hunt)
 
         let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refresh(_:)), keyEquivalent: "r")
         refreshItem.target = self
@@ -2968,6 +3048,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let statusPrefix: String
         if presence.isRestartMarked {
             statusPrefix = "RESTART  "
+        } else if presence.isUnreachable {
+            statusPrefix = "OFF?  "
         } else if presence.isNewToNetwork {
             statusPrefix = "NEW  "
         } else {
@@ -3087,6 +3169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 seenCount: 0,
                 isNewToNetwork: false,
                 isRestartMarked: false,
+                isUnreachable: false,
                 isNormal: false
             )
     }
@@ -3160,6 +3243,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh(nil)
     }
 
+    private var isHuntDeviceActive: Bool {
+        huntUntil.map { $0 > Date() } ?? false
+    }
+
+    @objc private func toggleHuntDevice(_ sender: NSMenuItem) {
+        if isHuntDeviceActive {
+            stopHuntDevice()
+            rebuildMenu()
+            return
+        }
+
+        startHuntDevice()
+    }
+
+    private func startHuntDevice() {
+        let until = Date().addingTimeInterval(3 * 60)
+        huntUntil = until
+        huntTimer?.invalidate()
+        huntTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard self.isHuntDeviceActive else {
+                self.stopHuntDevice()
+                self.rebuildMenu()
+                return
+            }
+            self.refresh(nil)
+        }
+        refresh(nil)
+    }
+
+    private func stopHuntDevice() {
+        huntTimer?.invalidate()
+        huntTimer = nil
+        huntUntil = nil
+    }
+
     @objc private func showDeviceRadar(_ sender: NSMenuItem) {
         NSApp.activate(ignoringOtherApps: true)
         if deviceLocationWindowController == nil {
@@ -3181,6 +3300,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if presence.isRestartMarked {
                 return "Restart marked: \(displayName(for: device)) (\(device.ip))"
             }
+            if presence.isUnreachable {
+                return "Not answering: \(displayName(for: device)) (\(device.ip))"
+            }
             if presence.isNewToNetwork {
                 return "New to network: \(displayName(for: device)) (\(device.ip))"
             }
@@ -3190,6 +3312,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lines.append("")
             lines.append("Network baseline:")
             lines.append(contentsOf: networkEvents)
+        }
+        if isHuntDeviceActive, let huntUntil {
+            lines.append("")
+            lines.append("Hunt Device is scanning until \(timeFormatter.string(from: huntUntil)).")
         }
         if !locationLayer.leftBehindAlerts.isEmpty {
             lines.append("")
