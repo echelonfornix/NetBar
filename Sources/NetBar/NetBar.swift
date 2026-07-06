@@ -78,6 +78,7 @@ struct DevicePresenceRecord: Codable {
     var reachableMissCount: Int?
     var normalSince: Date?
     var restartMarkedUntil: Date?
+    var restartNeedsConfirmation: Bool?
     var isPresent: Bool
     var wasReachable: Bool?
 }
@@ -354,6 +355,7 @@ final class StateStore {
                 reachableMissCount: nil,
                 normalSince: nil,
                 restartMarkedUntil: nil,
+                restartNeedsConfirmation: nil,
                 isPresent: false,
                 wasReachable: nil
             )
@@ -394,7 +396,10 @@ final class StateStore {
             }
             if isRestart {
                 record.restartMarkedUntil = now.addingTimeInterval(restartBadgeDuration)
-            } else if let restartMarkedUntil = record.restartMarkedUntil, restartMarkedUntil < now {
+                record.restartNeedsConfirmation = true
+            } else if record.restartNeedsConfirmation != true,
+                      let restartMarkedUntil = record.restartMarkedUntil,
+                      restartMarkedUntil < now {
                 record.restartMarkedUntil = nil
             }
 
@@ -414,7 +419,9 @@ final class StateStore {
                 record.reachableMissCount = (record.reachableMissCount ?? 0) + 1
                 record.wasReachable = false
             }
-            if let restartMarkedUntil = record.restartMarkedUntil, restartMarkedUntil < now {
+            if record.restartNeedsConfirmation != true,
+               let restartMarkedUntil = record.restartMarkedUntil,
+               restartMarkedUntil < now {
                 record.restartMarkedUntil = nil
             }
             state.networkPresence[id] = record
@@ -427,6 +434,14 @@ final class StateStore {
     func presenceStatus(for deviceID: String, now: Date) -> DevicePresenceStatus? {
         guard let record = state.networkPresence[deviceID] else { return nil }
         return presenceStatus(for: record, now: now)
+    }
+
+    func clearRestartMark(for deviceID: String) {
+        guard var record = state.networkPresence[deviceID] else { return }
+        record.restartNeedsConfirmation = false
+        record.restartMarkedUntil = nil
+        state.networkPresence[deviceID] = record
+        save()
     }
 
     func recordIdentities(from nodes: [DeviceLocationRadarNode]) {
@@ -597,11 +612,12 @@ final class StateStore {
     }
 
     private func presenceStatus(for record: DevicePresenceRecord, now: Date) -> DevicePresenceStatus {
-        let restartMarked = record.restartMarkedUntil.map { $0 >= now } ?? false
+        let restartMarked = record.restartNeedsConfirmation == true
+            || (record.restartMarkedUntil.map { $0 >= now } ?? false)
         if restartMarked {
             return DevicePresenceStatus(
                 title: "Device restart marked",
-                detail: "Known device disappeared briefly and came back. Good moment to rename it.",
+                detail: "Known device disappeared briefly and came back. Rename it or confirm to clear this mark.",
                 badge: "RESTART",
                 firstSeen: record.firstSeen,
                 seenCount: record.seenCount,
@@ -3086,6 +3102,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rename.representedObject = device.id
         submenu.addItem(rename)
 
+        if presence.isRestartMarked {
+            let confirmRestart = NSMenuItem(title: "Confirm Restart...", action: #selector(confirmRestartMark(_:)), keyEquivalent: "")
+            confirmRestart.target = self
+            confirmRestart.representedObject = device.id
+            submenu.addItem(confirmRestart)
+        }
+
         let clearName = NSMenuItem(title: "Clear Name", action: #selector(clearDeviceName(_:)), keyEquivalent: "")
         clearName.target = self
         clearName.representedObject = device.id
@@ -3422,6 +3445,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let deviceID = sender.representedObject as? String,
               let device = devicesByID[deviceID] else { return }
 
+        _ = promptRenameDevice(device)
+    }
+
+    @discardableResult
+    private func promptRenameDevice(_ device: Device) -> Bool {
         NSApp.activate(ignoringOtherApps: true)
 
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
@@ -3435,8 +3463,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Cancel")
 
         if alert.runModal() == .alertFirstButtonReturn {
-            store.setAlias(input.stringValue, for: deviceID)
+            store.setAlias(input.stringValue, for: device.id)
+            store.clearRestartMark(for: device.id)
             rebuildMenu()
+            updateNetworkMap()
+            updateDeviceLocationWindow()
+            return true
+        }
+        return false
+    }
+
+    @objc private func confirmRestartMark(_ sender: NSMenuItem) {
+        guard let deviceID = sender.representedObject as? String,
+              let device = devicesByID[deviceID] else { return }
+
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "Restart detected for \(displayName(for: device))"
+        alert.informativeText = "You can rename this device now, or clear the restart mark and leave the name unchanged."
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Clear Mark")
+        alert.addButton(withTitle: "Keep Mark")
+
+        let result = alert.runModal()
+        if result == .alertFirstButtonReturn {
+            _ = promptRenameDevice(device)
+        } else if result == .alertSecondButtonReturn {
+            store.clearRestartMark(for: device.id)
+            devicePresenceStatuses[device.id] = store.presenceStatus(for: device.id, now: Date())
+            rebuildMenu()
+            updateNetworkMap()
+            updateDeviceLocationWindow()
         }
     }
 

@@ -69,6 +69,8 @@ Use `Hunt Device...` when you deliberately want to identify something. Start the
 
 This works best for devices that answer local probes. Devices that block ping may still stay visible from stale ARP information, so NetBar treats the result as a useful hint rather than certainty.
 
+When a device is marked `RESTART`, use `Confirm Restart...` to rename it, clear the mark without renaming, or keep the mark visible while you decide.
+
 Use `Clear Name` to remove the saved friendly name and the learned identity links for that device. NetBar may still show a real hostname if macOS reports one from the network.
 
 ## Local Network Lookup
