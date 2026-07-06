@@ -65,7 +65,7 @@ NetBar keeps a local network-baseline record in its state file. Devices with onl
 
 If a normally seen device disappears briefly and then comes back, NetBar marks it as `RESTART`. This is useful when you power-cycle a plug, console, speaker, TV, or other device: refresh NetBar, find the restart-marked item, then use `Rename...` while it is obvious what you just turned back on.
 
-Use `Hunt Device...` when you deliberately want to identify something. Start the hunt, turn the mystery device off, wait for NetBar to mark a likely `OFF?` candidate, turn it back on, then rename the `RESTART` candidate. Hunt mode scans every 10 seconds for 3 minutes.
+Use `Hunt Device...` when you deliberately want to identify something. Start the hunt, leave the device on for the first scan, turn the mystery device off for at least 15 seconds, wait for NetBar to mark a likely `OFF?` candidate, turn it back on, then rename the `RESTART` candidate. Hunt mode scans every 4 seconds for 5 minutes.
 
 This works best for devices that answer local probes. Devices that block ping may still stay visible from stale ARP information, so NetBar treats the result as a useful hint rather than certainty.
 

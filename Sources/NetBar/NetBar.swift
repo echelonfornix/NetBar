@@ -335,11 +335,11 @@ final class StateStore {
         Dictionary(uniqueKeysWithValues: devices.map { ($0.id, identityContext(for: $0)) })
     }
 
-    func updateNetworkPresence(with devices: [Device], now: Date) -> [String: DevicePresenceStatus] {
+    func updateNetworkPresence(with devices: [Device], now: Date, huntActive: Bool = false) -> [String: DevicePresenceStatus] {
         let currentIDs = Set(devices.map(\.id))
         let normalSeenThreshold = 3
-        let restartWindow: TimeInterval = 3 * 60
-        let restartBadgeDuration: TimeInterval = 8 * 60
+        let restartWindow: TimeInterval = huntActive ? 10 * 60 : 3 * 60
+        let restartBadgeDuration: TimeInterval = huntActive ? 15 * 60 : 8 * 60
         var statuses: [String: DevicePresenceStatus] = [:]
 
         for device in devices {
@@ -2888,7 +2888,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         localInfo = refreshedLocalInfo
         devices = refreshedDevices
         devicesByID = Dictionary(uniqueKeysWithValues: devices.map { ($0.id, $0) })
-        devicePresenceStatuses = store.updateNetworkPresence(with: devices, now: now)
+        devicePresenceStatuses = store.updateNetworkPresence(with: devices, now: now, huntActive: isHuntDeviceActive)
         lastRefresh = now
         isRefreshing = false
         store.recordIdentities(from: locationLayer.radarNodes)
@@ -2965,7 +2965,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         addLocationLayerItems(to: menu)
 
         if isHuntDeviceActive, let huntUntil {
-            addDisabled("Hunt Device: scanning until \(timeFormatter.string(from: huntUntil))", to: menu)
+            addDisabled("Hunt Device: 4 sec scans until \(timeFormatter.string(from: huntUntil))", to: menu)
+            addDisabled("Leave device off for 15+ seconds, then turn it back on.", to: menu)
         }
 
         let huntTitle = isHuntDeviceActive ? "Stop Hunt Device" : "Hunt Device..."
@@ -3062,6 +3063,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         addDisabled(presence.detail, to: submenu)
         addDisabled("IP: \(device.ip)", to: submenu)
         addDisabled("Interface: \(device.interfaceName)", to: submenu)
+        addDisabled("Latest probe: \(device.isReachable ? "answered" : "not answered")", to: submenu)
         addDisabled("Address: \(device.addressStatus)", to: submenu)
         let guess = DeviceClassifier.classify(device: device, name: label)
         addDisabled("Guessed as: \(guess.summary)", to: submenu)
@@ -3258,10 +3260,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startHuntDevice() {
-        let until = Date().addingTimeInterval(3 * 60)
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Hunt Device"
+        alert.informativeText = "Leave the device switched on for the first scan, then turn it off for at least 15 seconds, then turn it back on. NetBar will scan quickly and mark likely OFF? and RESTART candidates."
+        alert.addButton(withTitle: "Start Hunt")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let until = Date().addingTimeInterval(5 * 60)
         huntUntil = until
         huntTimer?.invalidate()
-        huntTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+        huntTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
             guard let self else { return }
             guard self.isHuntDeviceActive else {
                 self.stopHuntDevice()
