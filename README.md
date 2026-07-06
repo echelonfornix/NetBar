@@ -18,7 +18,7 @@ Designed by Simon Stevens.
 - Guessed device categories, such as router, mobile, games console, computer, TV, printer, or smart-home kit.
 - A visual Network Map with the router, this Mac, and discovered devices.
 - Persistent network-baseline labels show whether a device is new to this network, normally seen, or likely just restarted.
-- Hunt Device mode scans every few seconds while you turn a mystery device off and on, then highlights likely `OFF?` and `RESTART` candidates so you can rename the thing you just power-cycled.
+- Hunt Device mode fast-checks known devices while you turn a mystery device off and on, then highlights likely `NO REPLY?` and `RESTART` candidates so you can rename the thing you just power-cycled.
 - A per-device Ping IP action sends 6 pings and reports the average, or marks it as a bad ping if no reply arrives within 6 seconds.
 - A Device Location Layer that takes background snapshots, stores them in local SQLite, and shows a radar-style confidence view for likely presence, mobility, novelty, and possible left-behind devices.
 - The Device Radar includes the router anchor, a Network Map-matched key, and a selected-device details panel with IP and optional MAC address.

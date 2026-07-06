@@ -630,9 +630,9 @@ final class StateStore {
 
         if record.lastReachableAt != nil, record.wasReachable == false {
             return DevicePresenceStatus(
-                title: "Known device not answering",
-                detail: "It may be powered off. If it answers again soon, NetBar will mark it as RESTART.",
-                badge: "OFF?",
+                title: "Known device gave no reply",
+                detail: "It may be off, asleep, or blocking probes. If it answers again soon, NetBar will mark it as RESTART.",
+                badge: "NO REPLY?",
                 firstSeen: record.firstSeen,
                 seenCount: record.seenCount,
                 isNewToNetwork: false,
@@ -713,9 +713,36 @@ final class NetworkScanner {
         }
     }
 
+    func scanKnownDevices(previousDevices: [String: Device], localInfo: LocalAddressInfo) -> [Device] {
+        let targetIPs = Set(previousDevices.values.map(\.ip)).subtracting([localInfo.ip].compactMap { $0 })
+        let reachableIPs = probeTargets(Array(targetIPs), timeout: 1.5)
+
+        let now = Date()
+        let output = run("/usr/sbin/arp", ["-a"])
+        let arpDevices = output
+            .split(separator: "\n")
+            .compactMap { parseARPLine(String($0), now: now, previousDevices: previousDevices, reachableIPs: reachableIPs) }
+        var devicesByID = Dictionary(uniqueKeysWithValues: arpDevices.map { ($0.id, $0) })
+
+        for previous in previousDevices.values where devicesByID[previous.id] == nil {
+            var copy = previous
+            copy.isReachable = reachableIPs.contains(previous.ip)
+            copy.lastSeen = now
+            devicesByID[copy.id] = copy
+        }
+
+        return Array(devicesByID.values).sorted { lhs, rhs in
+            compareIPv4(lhs.ip, rhs.ip)
+        }
+    }
+
     private func probeLocalSubnet(from localIP: String?) -> Set<String> {
         guard let targets = localSubnetTargets(from: localIP), !targets.isEmpty else { return [] }
+        return probeTargets(targets, timeout: 6)
+    }
 
+    private func probeTargets(_ targets: [String], timeout: TimeInterval) -> Set<String> {
+        guard !targets.isEmpty else { return [] }
         let queue = DispatchQueue(label: "netbar.local-lookup", attributes: .concurrent)
         let group = DispatchGroup()
         let limit = DispatchSemaphore(value: 32)
@@ -736,7 +763,7 @@ final class NetworkScanner {
             }
         }
 
-        _ = group.wait(timeout: .now() + 6)
+        _ = group.wait(timeout: .now() + timeout)
         return reachableIPs
     }
 
@@ -1352,7 +1379,7 @@ final class NetworkMapView: NSView {
         shadow.set()
 
         let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
-        if node.isNew || node.statusBadge == "RESTART" || node.statusBadge == "OFF?" {
+        if node.isNew || node.statusBadge == "RESTART" || node.statusBadge == "NO REPLY?" {
             (node.statusColor ?? node.accent).withAlphaComponent(0.08).setFill()
         } else {
             NSColor.controlBackgroundColor.setFill()
@@ -1364,7 +1391,7 @@ final class NetworkMapView: NSView {
         NSBezierPath(roundedRect: NSRect(x: rect.minX, y: rect.minY, width: 7, height: rect.height), xRadius: 4, yRadius: 4).fill()
 
         let highlightColor = node.statusColor ?? node.accent
-        let isHighlighted = node.isNew || node.statusBadge == "RESTART" || node.statusBadge == "OFF?"
+        let isHighlighted = node.isNew || node.statusBadge == "RESTART" || node.statusBadge == "NO REPLY?"
         (isHighlighted ? highlightColor : NSColor.separatorColor).withAlphaComponent(isHighlighted ? 0.95 : 0.8).setStroke()
         path.lineWidth = isHighlighted ? 2.2 : 1
         path.stroke()
@@ -1386,7 +1413,7 @@ final class NetworkMapView: NSView {
 
         let textX = rect.minX + 78
         let textWidth = rect.maxX - textX - 18
-        let titleWidth = node.statusBadge == nil ? textWidth : max(80, textWidth - 70)
+        let titleWidth = node.statusBadge == nil ? textWidth : max(70, textWidth - (node.statusBadge == "NO REPLY?" ? 88 : 70))
         drawText(
             node.title,
             in: NSRect(x: textX, y: rect.minY + 16, width: titleWidth, height: 20),
@@ -1408,7 +1435,7 @@ final class NetworkMapView: NSView {
     }
 
     private func drawStatusBadge(_ text: String, in rect: NSRect, accent: NSColor) {
-        let badgeWidth: CGFloat = text == "RESTART" ? 62 : 46
+        let badgeWidth: CGFloat = text == "NO REPLY?" ? 76 : (text == "RESTART" ? 62 : 46)
         let badgeRect = NSRect(x: rect.maxX - badgeWidth - 15, y: rect.minY + 13, width: badgeWidth, height: 18)
         let badgePath = NSBezierPath(roundedRect: badgeRect, xRadius: 9, yRadius: 9)
         accent.setFill()
@@ -1514,11 +1541,11 @@ final class NetworkMapWindowController: NSWindowController {
         let refreshed = lastRefresh.map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) } ?? "never"
         let newCount = mapView.deviceNodes.filter(\.isNew).count
         let restartCount = mapView.deviceNodes.filter { $0.statusBadge == "RESTART" }.count
-        let offCount = mapView.deviceNodes.filter { $0.statusBadge == "OFF?" }.count
+        let noReplyCount = mapView.deviceNodes.filter { $0.statusBadge == "NO REPLY?" }.count
         let statusParts = [
             newCount > 0 ? "\(newCount) new" : nil,
             restartCount > 0 ? "\(restartCount) restarted" : nil,
-            offCount > 0 ? "\(offCount) off?" : nil
+            noReplyCount > 0 ? "\(noReplyCount) no reply" : nil
         ].compactMap { $0 }
         let statusText = statusParts.isEmpty ? "" : " - \(statusParts.joined(separator: ", "))"
         mapView.footerText = "\(mapView.deviceNodes.count) devices below this Mac\(statusText) - refreshed \(refreshed)"
@@ -1562,7 +1589,7 @@ final class NetworkMapWindowController: NSWindowController {
             statusBadge = "RESTART"
             statusColor = .systemOrange
         } else if presence?.isUnreachable == true {
-            statusBadge = "OFF?"
+            statusBadge = "NO REPLY?"
             statusColor = .systemGray
         } else if presence?.isNewToNetwork == true {
             statusBadge = "NEW"
@@ -2823,6 +2850,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var localInfo = LocalAddressInfo(interfaceName: nil, ip: nil, assignment: "Unknown")
     private var lastRefresh: Date?
     private var isRefreshing = false
+    private var isHuntRefreshing = false
     private var timer: Timer?
     private var huntTimer: Timer?
     private var huntUntil: Date?
@@ -2913,6 +2941,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateDeviceLocationWindow()
     }
 
+    private func huntRefresh() {
+        guard isHuntDeviceActive, !isHuntRefreshing else { return }
+        isHuntRefreshing = true
+
+        let previousDevices = devicesByID
+        let currentLocalInfo = localInfo
+        let scanner = self.scanner
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let localInfo = currentLocalInfo.ip == nil ? scanner.localAddressInfo() : currentLocalInfo
+            let devices = scanner.scanKnownDevices(previousDevices: previousDevices, localInfo: localInfo)
+            let now = Date()
+
+            DispatchQueue.main.async {
+                self?.finishHuntRefresh(
+                    devices: devices,
+                    localInfo: localInfo,
+                    now: now
+                )
+            }
+        }
+    }
+
+    private func finishHuntRefresh(devices refreshedDevices: [Device], localInfo refreshedLocalInfo: LocalAddressInfo, now: Date) {
+        localInfo = refreshedLocalInfo
+        devices = refreshedDevices
+        devicesByID = Dictionary(uniqueKeysWithValues: devices.map { ($0.id, $0) })
+        devicePresenceStatuses = store.updateNetworkPresence(with: devices, now: now, huntActive: true)
+        lastRefresh = now
+        isHuntRefreshing = false
+        rebuildMenu()
+        updateNetworkMap()
+    }
+
     private func rebuildMenu() {
         let menu = NSMenu()
 
@@ -2923,11 +2985,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let refreshed = lastRefresh.map { timeFormatter.string(from: $0) } ?? "Never"
         let newCount = devices.filter { presenceStatus(for: $0).isNewToNetwork }.count
         let restartCount = devices.filter { presenceStatus(for: $0).isRestartMarked }.count
-        let offCount = devices.filter { presenceStatus(for: $0).isUnreachable }.count
+        let noReplyCount = devices.filter { presenceStatus(for: $0).isUnreachable }.count
         let statusParts = [
             newCount > 0 ? "\(newCount) new" : nil,
             restartCount > 0 ? "\(restartCount) restarted" : nil,
-            offCount > 0 ? "\(offCount) off?" : nil,
+            noReplyCount > 0 ? "\(noReplyCount) no reply" : nil,
             isHuntDeviceActive ? "hunt active" : nil
         ].compactMap { $0 }
         let statusSummary = statusParts.isEmpty ? "" : " - \(statusParts.joined(separator: ", "))"
@@ -2982,7 +3044,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if isHuntDeviceActive, let huntUntil {
             addDisabled("Hunt Device: 4 sec scans until \(timeFormatter.string(from: huntUntil))", to: menu)
-            addDisabled("Leave device off for 15+ seconds, then turn it back on.", to: menu)
+            addDisabled("Leave device off for 10+ seconds, then turn it back on.", to: menu)
         }
 
         let huntTitle = isHuntDeviceActive ? "Stop Hunt Device" : "Hunt Device..."
@@ -3066,7 +3128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if presence.isRestartMarked {
             statusPrefix = "RESTART  "
         } else if presence.isUnreachable {
-            statusPrefix = "OFF?  "
+            statusPrefix = "NO REPLY?  "
         } else if presence.isNewToNetwork {
             statusPrefix = "NEW  "
         } else {
@@ -3286,7 +3348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Hunt Device"
-        alert.informativeText = "Leave the device switched on for the first scan, then turn it off for at least 15 seconds, then turn it back on. NetBar will scan quickly and mark likely OFF? and RESTART candidates."
+        alert.informativeText = "Leave the device switched on for the first scan, then turn it off for at least 10 seconds, then turn it back on. NetBar will fast-check known devices and mark likely NO REPLY? and RESTART candidates."
         alert.addButton(withTitle: "Start Hunt")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -3301,9 +3363,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.rebuildMenu()
                 return
             }
-            self.refresh(nil)
+            self.huntRefresh()
         }
-        refresh(nil)
+        if devicesByID.isEmpty {
+            refresh(nil)
+        } else {
+            huntRefresh()
+        }
     }
 
     private func stopHuntDevice() {
