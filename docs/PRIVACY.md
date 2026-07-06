@@ -16,8 +16,9 @@ It stores:
 - Friendly names you assign to devices.
 - Whether MAC addresses should be visible in the menu.
 - Whether Launch at Login should be enabled.
+- Local network-baseline records, including first seen, last seen, seen count, missing count, and short restart-mark status for devices.
 - Device Location Layer snapshots, observations, confidence scores, and learned baselines.
-- Local identity profiles for friendly-named devices, including recent IPs, MACs, hostnames, zones, and optional locked MAC addresses.
+- Local identity profiles for friendly-named devices, including recent IPs, MACs, hostnames, observed zones, confirmed zone calibration hints, and optional locked MAC addresses.
 
 Stored data location:
 
@@ -35,6 +36,8 @@ The Device Location Layer is local-only. It learns from repeated snapshots of de
 It reports confidence states rather than exact locations. For example, it may say a device is probably `Home network present` or `Bluetooth nearby`, but it should not be read as GPS, room-level truth, or exact distance.
 
 Ping replies are used only as a presence signal. Wi-Fi and Bluetooth signal strength can be noisy, so NetBar treats them as hints and combines them with repeated observations over time.
+
+Confirmed room zones are user-supplied calibration hints. They stay local and are used to move the device on the radar, not to claim exact physical positioning.
 
 ## Device Type Guesses
 

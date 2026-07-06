@@ -59,9 +59,11 @@ NetBar stores its LaunchAgent at:
 ~/Library/LaunchAgents/local.netbar.status.login.plist
 ```
 
-## New Device Highlighting
+## New, Normal, and Restarted Devices
 
-NetBar uses the first scan after launch as its baseline. Devices that appear after that are marked `NEW` in the Menu Bar list and highlighted on the Network Map for a few minutes.
+NetBar keeps a local network-baseline record in its state file. Devices with only a few sightings are marked `NEW`; devices seen repeatedly become `Normally seen on this network`.
+
+If a normally seen device disappears briefly and then comes back, NetBar marks it as `RESTART`. This is useful when you power-cycle a plug, console, speaker, TV, or other device: refresh NetBar, find the restart-marked item, then use `Rename...` while it is obvious what you just turned back on.
 
 ## Local Network Lookup
 
@@ -74,6 +76,8 @@ NetBar starts the Device Location Layer from launch and refreshes it with the no
 The radar shows the router as the fixed network anchor and uses the same device-type colours/icons as the Network Map. Select a radar dot to expand its IP, confidence zone, category, and MAC address when `Show MAC addresses` is enabled.
 
 Use the pencil in the selected-device panel to save a friendly name. That name is shared with the Menu Bar list and Network Map.
+
+Use `Zone` in the selected-device panel when you confirm a device is in Kitchen, Bedroom, Office, Living Room, Hallway, or Desk. NetBar stores that as a local calibration hint, moves the device on the radar, and uses the confirmed zone as part of the friendly-name identity profile.
 
 The radar view filters this Mac and broadcast addresses, then deduplicates repeated Bluetooth records so the view stays focused on real device dots.
 

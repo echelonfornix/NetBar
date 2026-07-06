@@ -53,6 +53,7 @@ struct DeviceIdentityProfile: Codable {
     var ips: [String] = []
     var hostnames: [String] = []
     var lockedMacs: [String] = []
+    var confirmedZone: String?
     var lastZone: String?
     var lastSeen: Date?
 }
@@ -61,7 +62,30 @@ struct DeviceIdentityContext {
     var alias: String?
     var note: String?
     var isMacLocked: Bool
+    var confirmedZone: String?
     var previousZone: String?
+}
+
+struct DevicePresenceRecord: Codable {
+    var firstSeen: Date
+    var lastSeen: Date?
+    var lastDisappearedAt: Date?
+    var seenCount: Int
+    var absenceCount: Int
+    var normalSince: Date?
+    var restartMarkedUntil: Date?
+    var isPresent: Bool
+}
+
+struct DevicePresenceStatus {
+    var title: String
+    var detail: String
+    var badge: String?
+    var firstSeen: Date?
+    var seenCount: Int
+    var isNewToNetwork: Bool
+    var isRestartMarked: Bool
+    var isNormal: Bool
 }
 
 enum DeviceClassifier {
@@ -183,12 +207,14 @@ enum DeviceClassifier {
 struct StoredState: Codable {
     var aliases: [String: String] = [:]
     var identityProfiles: [String: DeviceIdentityProfile] = [:]
+    var networkPresence: [String: DevicePresenceRecord] = [:]
     var showMacAddresses: Bool = false
     var launchAtLoginEnabled: Bool = true
 
     enum CodingKeys: String, CodingKey {
         case aliases
         case identityProfiles
+        case networkPresence
         case showMacAddresses
         case launchAtLoginEnabled
     }
@@ -199,6 +225,7 @@ struct StoredState: Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         aliases = try container.decodeIfPresent([String: String].self, forKey: .aliases) ?? [:]
         identityProfiles = try container.decodeIfPresent([String: DeviceIdentityProfile].self, forKey: .identityProfiles) ?? [:]
+        networkPresence = try container.decodeIfPresent([String: DevicePresenceRecord].self, forKey: .networkPresence) ?? [:]
         showMacAddresses = try container.decodeIfPresent(Bool.self, forKey: .showMacAddresses) ?? false
         launchAtLoginEnabled = try container.decodeIfPresent(Bool.self, forKey: .launchAtLoginEnabled) ?? true
     }
@@ -249,6 +276,69 @@ final class StateStore {
 
     func identityContexts(for devices: [Device]) -> [String: DeviceIdentityContext] {
         Dictionary(uniqueKeysWithValues: devices.map { ($0.id, identityContext(for: $0)) })
+    }
+
+    func updateNetworkPresence(with devices: [Device], now: Date) -> [String: DevicePresenceStatus] {
+        let currentIDs = Set(devices.map(\.id))
+        let normalSeenThreshold = 3
+        let restartWindow: TimeInterval = 3 * 60
+        let restartBadgeDuration: TimeInterval = 8 * 60
+        var statuses: [String: DevicePresenceStatus] = [:]
+
+        for device in devices {
+            var record = state.networkPresence[device.id] ?? DevicePresenceRecord(
+                firstSeen: now,
+                lastSeen: nil,
+                lastDisappearedAt: nil,
+                seenCount: 0,
+                absenceCount: 0,
+                normalSince: nil,
+                restartMarkedUntil: nil,
+                isPresent: false
+            )
+
+            let wasKnown = state.networkPresence[device.id] != nil
+            let wasMissing = wasKnown && !record.isPresent
+            let disappearedRecently = record.lastDisappearedAt.map { now.timeIntervalSince($0) <= restartWindow } ?? false
+            let wasEstablished = record.normalSince != nil || record.seenCount >= normalSeenThreshold
+            let isRestart = wasMissing && disappearedRecently && wasEstablished
+
+            record.seenCount += 1
+            record.lastSeen = now
+            record.isPresent = true
+            if record.seenCount >= normalSeenThreshold, record.normalSince == nil {
+                record.normalSince = now
+            }
+            if isRestart {
+                record.restartMarkedUntil = now.addingTimeInterval(restartBadgeDuration)
+            } else if let restartMarkedUntil = record.restartMarkedUntil, restartMarkedUntil < now {
+                record.restartMarkedUntil = nil
+            }
+
+            state.networkPresence[device.id] = record
+            statuses[device.id] = presenceStatus(for: record, now: now)
+        }
+
+        for id in state.networkPresence.keys where !currentIDs.contains(id) {
+            guard var record = state.networkPresence[id] else { continue }
+            if record.isPresent {
+                record.isPresent = false
+                record.lastDisappearedAt = now
+                record.absenceCount += 1
+            }
+            if let restartMarkedUntil = record.restartMarkedUntil, restartMarkedUntil < now {
+                record.restartMarkedUntil = nil
+            }
+            state.networkPresence[id] = record
+        }
+
+        save()
+        return statuses
+    }
+
+    func presenceStatus(for deviceID: String, now: Date) -> DevicePresenceStatus? {
+        guard let record = state.networkPresence[deviceID] else { return nil }
+        return presenceStatus(for: record, now: now)
     }
 
     func recordIdentities(from nodes: [DeviceLocationRadarNode]) {
@@ -312,6 +402,44 @@ final class StateStore {
         save()
     }
 
+    func setZone(_ zone: String?, for node: DeviceLocationRadarNode) {
+        let name = displayNameForIdentity(node) ?? node.title
+        var profile = profile(named: name)
+        let cleanedZone = zone?.trimmingCharacters(in: .whitespacesAndNewlines)
+        profile.deviceIDs = appendUnique(node.id, to: profile.deviceIDs, limit: 12)
+        if let mac = node.mac?.lowercased(), !mac.isEmpty {
+            profile.macs = appendUnique(mac, to: profile.macs, limit: 12)
+        }
+        if let ip = node.ip, !ip.isEmpty {
+            profile.ips = appendUnique(ip, to: profile.ips, limit: 12)
+        }
+        profile.confirmedZone = cleanedZone?.isEmpty == false ? cleanedZone : nil
+        profile.lastZone = profile.confirmedZone ?? node.zone
+        profile.lastSeen = Date()
+        state.identityProfiles[profileKey(for: name)] = profile
+        if state.aliases[node.id] == nil {
+            state.aliases[node.id] = name
+        }
+        save()
+    }
+
+    func setZone(_ zone: String?, for device: Device, name: String) {
+        var profile = profile(named: name)
+        let cleanedZone = zone?.trimmingCharacters(in: .whitespacesAndNewlines)
+        profile.deviceIDs = appendUnique(device.id, to: profile.deviceIDs, limit: 12)
+        profile.macs = appendUnique(device.mac.lowercased(), to: profile.macs, limit: 12)
+        profile.ips = appendUnique(device.ip, to: profile.ips, limit: 12)
+        if let hostname = device.hostname?.lowercased(), !hostname.isEmpty {
+            profile.hostnames = appendUnique(hostname, to: profile.hostnames, limit: 8)
+        }
+        profile.confirmedZone = cleanedZone?.isEmpty == false ? cleanedZone : nil
+        profile.lastZone = profile.confirmedZone
+        profile.lastSeen = Date()
+        state.identityProfiles[profileKey(for: name)] = profile
+        state.aliases[device.id] = name
+        save()
+    }
+
     private func identityContext(for device: Device) -> DeviceIdentityContext {
         if let directAlias = state.aliases[device.id], !directAlias.isEmpty {
             let profile = profile(named: directAlias)
@@ -319,13 +447,14 @@ final class StateStore {
                 alias: directAlias,
                 note: profile.lockedMacs.contains(device.mac.lowercased()) ? "MAC locked match" : "Saved name match",
                 isMacLocked: profile.lockedMacs.contains(device.mac.lowercased()),
+                confirmedZone: profile.confirmedZone,
                 previousZone: profile.lastZone
             )
         }
 
         let mac = device.mac.lowercased()
         let hostname = device.hostname?.lowercased()
-        var bestContext = DeviceIdentityContext(alias: nil, note: nil, isMacLocked: false, previousZone: nil)
+        var bestContext = DeviceIdentityContext(alias: nil, note: nil, isMacLocked: false, confirmedZone: nil, previousZone: nil)
 
         for profile in state.identityProfiles.values {
             let lockedMatch = profile.lockedMacs.contains(mac)
@@ -334,6 +463,7 @@ final class StateStore {
                     alias: profile.name,
                     note: lockedMatch ? "MAC locked match" : "Known MAC/device identity",
                     isMacLocked: lockedMatch,
+                    confirmedZone: profile.confirmedZone,
                     previousZone: profile.lastZone
                 )
             }
@@ -343,6 +473,7 @@ final class StateStore {
                     alias: profile.name,
                     note: "Hostname matches saved identity",
                     isMacLocked: false,
+                    confirmedZone: profile.confirmedZone,
                     previousZone: profile.lastZone
                 )
             } else if profile.ips.contains(device.ip), bestContext.alias == nil {
@@ -351,6 +482,7 @@ final class StateStore {
                     alias: profile.name,
                     note: lockedMismatch ? "IP matches \(profile.name), but locked MAC differs" : "IP matches saved identity; confirm if MAC rotated",
                     isMacLocked: false,
+                    confirmedZone: profile.confirmedZone,
                     previousZone: profile.lastZone
                 )
             }
@@ -374,6 +506,46 @@ final class StateStore {
         var next = values.filter { $0 != cleaned }
         next.insert(cleaned, at: 0)
         return Array(next.prefix(limit))
+    }
+
+    private func presenceStatus(for record: DevicePresenceRecord, now: Date) -> DevicePresenceStatus {
+        let restartMarked = record.restartMarkedUntil.map { $0 >= now } ?? false
+        if restartMarked {
+            return DevicePresenceStatus(
+                title: "Device restart marked",
+                detail: "Known device disappeared briefly and came back. Good moment to rename it.",
+                badge: "RESTART",
+                firstSeen: record.firstSeen,
+                seenCount: record.seenCount,
+                isNewToNetwork: false,
+                isRestartMarked: true,
+                isNormal: false
+            )
+        }
+
+        if record.normalSince != nil || record.seenCount >= 3 {
+            return DevicePresenceStatus(
+                title: "Normally seen on this network",
+                detail: "Seen repeatedly by NetBar.",
+                badge: "NORMAL",
+                firstSeen: record.firstSeen,
+                seenCount: record.seenCount,
+                isNewToNetwork: false,
+                isRestartMarked: false,
+                isNormal: true
+            )
+        }
+
+        return DevicePresenceStatus(
+            title: "New to this network",
+            detail: "Not enough sightings yet. Rename it now if you just turned something on.",
+            badge: "NEW",
+            firstSeen: record.firstSeen,
+            seenCount: record.seenCount,
+            isNewToNetwork: true,
+            isRestartMarked: false,
+            isNormal: false
+        )
     }
 
     private func shouldRecordIdentity(for node: DeviceLocationRadarNode) -> Bool {
@@ -898,6 +1070,8 @@ struct NetworkMapNode {
     var icon: String
     var accent: NSColor
     var isNew: Bool = false
+    var statusBadge: String? = nil
+    var statusColor: NSColor? = nil
 }
 
 final class NetworkMapView: NSView {
@@ -1050,8 +1224,8 @@ final class NetworkMapView: NSView {
         shadow.set()
 
         let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
-        if node.isNew {
-            node.accent.withAlphaComponent(0.08).setFill()
+        if node.isNew || node.statusBadge == "RESTART" {
+            (node.statusColor ?? node.accent).withAlphaComponent(0.08).setFill()
         } else {
             NSColor.controlBackgroundColor.setFill()
         }
@@ -1061,12 +1235,14 @@ final class NetworkMapView: NSView {
         node.accent.withAlphaComponent(0.20).setFill()
         NSBezierPath(roundedRect: NSRect(x: rect.minX, y: rect.minY, width: 7, height: rect.height), xRadius: 4, yRadius: 4).fill()
 
-        (node.isNew ? node.accent : NSColor.separatorColor).withAlphaComponent(node.isNew ? 0.95 : 0.8).setStroke()
-        path.lineWidth = node.isNew ? 2.2 : 1
+        let highlightColor = node.statusColor ?? node.accent
+        let isHighlighted = node.isNew || node.statusBadge == "RESTART"
+        (isHighlighted ? highlightColor : NSColor.separatorColor).withAlphaComponent(isHighlighted ? 0.95 : 0.8).setStroke()
+        path.lineWidth = isHighlighted ? 2.2 : 1
         path.stroke()
 
-        if node.isNew {
-            drawNewBadge(in: rect, accent: node.accent)
+        if let statusBadge = node.statusBadge {
+            drawStatusBadge(statusBadge, in: rect, accent: highlightColor)
         }
 
         let badgeRect = NSRect(x: rect.minX + 20, y: rect.minY + 22, width: 42, height: 42)
@@ -1082,7 +1258,7 @@ final class NetworkMapView: NSView {
 
         let textX = rect.minX + 78
         let textWidth = rect.maxX - textX - 18
-        let titleWidth = node.isNew ? max(80, textWidth - 52) : textWidth
+        let titleWidth = node.statusBadge == nil ? textWidth : max(80, textWidth - 70)
         drawText(
             node.title,
             in: NSRect(x: textX, y: rect.minY + 16, width: titleWidth, height: 20),
@@ -1103,13 +1279,14 @@ final class NetworkMapView: NSView {
         )
     }
 
-    private func drawNewBadge(in rect: NSRect, accent: NSColor) {
-        let badgeRect = NSRect(x: rect.maxX - 54, y: rect.minY + 13, width: 39, height: 18)
+    private func drawStatusBadge(_ text: String, in rect: NSRect, accent: NSColor) {
+        let badgeWidth: CGFloat = text == "RESTART" ? 62 : 46
+        let badgeRect = NSRect(x: rect.maxX - badgeWidth - 15, y: rect.minY + 13, width: badgeWidth, height: 18)
         let badgePath = NSBezierPath(roundedRect: badgeRect, xRadius: 9, yRadius: 9)
         accent.setFill()
         badgePath.fill()
         drawText(
-            "NEW",
+            text,
             in: badgeRect.insetBy(dx: 5, dy: 2),
             font: NSFont.systemFont(ofSize: 9, weight: .bold),
             color: .white,
@@ -1173,7 +1350,7 @@ final class NetworkMapWindowController: NSWindowController {
         nil
     }
 
-    func update(devices: [Device], localInfo: LocalAddressInfo, gatewayIP: String?, lastRefresh: Date?, newDeviceIDs: Set<String>) {
+    func update(devices: [Device], localInfo: LocalAddressInfo, gatewayIP: String?, lastRefresh: Date?, presenceStatuses: [String: DevicePresenceStatus]) {
         let localIP = localInfo.ip
         let routerDevice = findRouter(in: devices, gatewayIP: gatewayIP, localIP: localIP)
         let routerIP = routerDevice?.ip ?? gatewayIP
@@ -1204,12 +1381,17 @@ final class NetworkMapWindowController: NSWindowController {
                     && device.ip != routerIP
                     && device.id != routerDevice?.id
             }
-            .map { node(for: $0, role: nil, forcedIcon: nil, accent: nil, isNew: newDeviceIDs.contains($0.id)) }
+            .map { node(for: $0, role: nil, forcedIcon: nil, accent: nil, presence: presenceStatuses[$0.id]) }
 
         let refreshed = lastRefresh.map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) } ?? "never"
         let newCount = mapView.deviceNodes.filter(\.isNew).count
-        let newText = newCount > 0 ? " - \(newCount) new" : ""
-        mapView.footerText = "\(mapView.deviceNodes.count) devices below this Mac\(newText) - refreshed \(refreshed)"
+        let restartCount = mapView.deviceNodes.filter { $0.statusBadge == "RESTART" }.count
+        let statusParts = [
+            newCount > 0 ? "\(newCount) new" : nil,
+            restartCount > 0 ? "\(restartCount) restarted" : nil
+        ].compactMap { $0 }
+        let statusText = statusParts.isEmpty ? "" : " - \(statusParts.joined(separator: ", "))"
+        mapView.footerText = "\(mapView.deviceNodes.count) devices below this Mac\(statusText) - refreshed \(refreshed)"
         mapView.refreshLayout(width: window?.contentView?.bounds.width ?? 760)
     }
 
@@ -1232,7 +1414,7 @@ final class NetworkMapWindowController: NSWindowController {
         }
     }
 
-    private func node(for device: Device, role: String?, forcedIcon: String?, accent: NSColor?, isNew: Bool = false) -> NetworkMapNode {
+    private func node(for device: Device, role: String?, forcedIcon: String?, accent: NSColor?, presence: DevicePresenceStatus? = nil) -> NetworkMapNode {
         let name = displayName(for: device)
         let classification = DeviceClassifier.classify(device: device, name: name)
         let title: String
@@ -1244,13 +1426,28 @@ final class NetworkMapWindowController: NSWindowController {
             title = name
         }
 
+        let statusBadge: String?
+        let statusColor: NSColor?
+        if presence?.isRestartMarked == true {
+            statusBadge = "RESTART"
+            statusColor = .systemOrange
+        } else if presence?.isNewToNetwork == true {
+            statusBadge = "NEW"
+            statusColor = accent ?? classification.accent
+        } else {
+            statusBadge = nil
+            statusColor = nil
+        }
+
         return NetworkMapNode(
             title: title,
             subtitle: device.ip,
-            detail: role ?? mapDetail(for: classification),
+            detail: role ?? presence?.title ?? mapDetail(for: classification),
             icon: forcedIcon ?? classification.icon,
             accent: accent ?? classification.accent,
-            isNew: isNew
+            isNew: presence?.isNewToNetwork == true,
+            statusBadge: statusBadge,
+            statusColor: statusColor
         )
     }
 
@@ -1305,6 +1502,7 @@ struct DeviceLocationRadarNode {
     var identityNote: String?
     var movementNote: String?
     var isMacLocked: Bool
+    var isZoneConfirmed: Bool
 }
 
 final class DeviceLocationLayer {
@@ -1322,6 +1520,7 @@ final class DeviceLocationLayer {
         var accent: NSColor
         var confidenceHint: String
         var identityNote: String?
+        var confirmedZone: String?
         var previousZone: String?
         var isMacLocked: Bool
     }
@@ -1541,6 +1740,7 @@ final class DeviceLocationLayer {
                 accent: isRouter ? .systemBlue : guess.accent,
                 confidenceHint: guess.confidence,
                 identityNote: identityContext?.note,
+                confirmedZone: identityContext?.confirmedZone,
                 previousZone: identityContext?.previousZone,
                 isMacLocked: identityContext?.isMacLocked ?? false
             )
@@ -1565,6 +1765,7 @@ final class DeviceLocationLayer {
                 accent: .systemBlue,
                 confidenceHint: "medium",
                 identityNote: aliases[id] == nil ? nil : "Saved router name",
+                confirmedZone: nil,
                 previousZone: nil,
                 isMacLocked: false
             )
@@ -1658,6 +1859,7 @@ final class DeviceLocationLayer {
                         accent: .systemPurple,
                         confidenceHint: rssiValue == nil ? "low" : "medium",
                         identityNote: nil,
+                        confirmedZone: nil,
                         previousZone: nil,
                         isMacLocked: false
                     )
@@ -1774,7 +1976,8 @@ final class DeviceLocationLayer {
             let nodeCategory = isRouterObservation ? "Router" : observation.displayType
             let nodeIcon = isRouterObservation ? "📡" : observation.icon
             let nodeAccent: NSColor = isRouterObservation ? .systemBlue : observation.accent
-            let zone = isRouterObservation ? "Near router" : zoneLabel(for: observation)
+            let observedZone = isRouterObservation ? "Near router" : zoneLabel(for: observation)
+            let zone = observation.confirmedZone ?? observedZone
             let state = "\(nodeTitle): \(zone), \(nodeCategory), confidence \(Int(confidence.rounded()))%"
             let isLeftBehind = leftBehindScore >= 60
             let movementNote = movementNote(from: observation.previousZone, to: zone)
@@ -1801,13 +2004,14 @@ final class DeviceLocationLayer {
                     category: nodeCategory,
                     icon: nodeIcon,
                     accent: nodeAccent,
-                    angle: angle(for: observation.id),
-                    radius: isRouterObservation ? 0.92 : radius(for: observation),
+                    angle: angle(for: observation.id, zone: zone),
+                    radius: isRouterObservation ? 0.92 : radius(for: observation, zone: zone),
                     isLeftBehind: isLeftBehind,
                     isNew: appeared.contains(observation.id),
                     identityNote: observation.identityNote,
                     movementNote: movementNote,
-                    isMacLocked: observation.isMacLocked
+                    isMacLocked: observation.isMacLocked,
+                    isZoneConfirmed: observation.confirmedZone != nil
                 )
             )
 
@@ -1940,16 +2144,22 @@ final class DeviceLocationLayer {
         }
     }
 
-    private func angle(for id: String) -> CGFloat {
+    private func angle(for id: String, zone: String? = nil) -> CGFloat {
+        if let zoneAngle = fixedZoneAngle(zone) {
+            return zoneAngle
+        }
         let total = id.unicodeScalars.reduce(0) { partial, scalar in
             partial + Int(scalar.value)
         }
         return CGFloat(total % 360) * .pi / 180
     }
 
-    private func radius(for observation: Observation) -> CGFloat {
+    private func radius(for observation: Observation, zone: String? = nil) -> CGFloat {
         if observation.source == "router" {
             return 0.92
+        }
+        if fixedZoneAngle(zone) != nil {
+            return 0.68
         }
         if observation.source == "bluetooth" {
             return 0.36
@@ -1963,6 +2173,26 @@ final class DeviceLocationLayer {
             return 0.50
         default:
             return 0.84
+        }
+    }
+
+    private func fixedZoneAngle(_ zone: String?) -> CGFloat? {
+        guard let zone else { return nil }
+        switch zone.lowercased() {
+        case "kitchen":
+            return 5.10
+        case "bedroom":
+            return 3.78
+        case "office":
+            return 0.25
+        case "living room":
+            return 1.55
+        case "hallway":
+            return 2.50
+        case "desk":
+            return 0.72
+        default:
+            return nil
         }
     }
 
@@ -2046,12 +2276,14 @@ final class DeviceLocationRadarView: NSView {
     var leftBehindAlerts: [String] = []
     var showMacAddresses = false
     var onRenameNode: ((DeviceLocationRadarNode) -> Void)?
+    var onSetZoneNode: ((DeviceLocationRadarNode) -> Void)?
 
     private var selectedNodeID: String?
     private var sweepAngle: CGFloat = 0
     private var animationTimer: Timer?
     private var hitRects: [String: NSRect] = [:]
     private var renameButtonRect: NSRect?
+    private var zoneButtonRect: NSRect?
 
     override var isFlipped: Bool {
         true
@@ -2094,6 +2326,10 @@ final class DeviceLocationRadarView: NSView {
             onRenameNode?(selectedNode)
             return
         }
+        if let zoneButtonRect, zoneButtonRect.contains(location), let selectedNode {
+            onSetZoneNode?(selectedNode)
+            return
+        }
         if let match = hitRects.first(where: { $0.value.contains(location) }) {
             selectedNodeID = match.key
             needsDisplay = true
@@ -2107,6 +2343,7 @@ final class DeviceLocationRadarView: NSView {
         let layout = currentLayout()
         hitRects.removeAll()
         renameButtonRect = nil
+        zoneButtonRect = nil
 
         drawHeader()
         drawRadar(in: layout.radar)
@@ -2290,10 +2527,17 @@ final class DeviceLocationRadarView: NSView {
         NSBezierPath(ovalIn: iconRect).fill()
         drawText(node.icon, in: iconRect.insetBy(dx: 6, dy: 7), font: .systemFont(ofSize: 19), color: .white, alignment: .center)
 
+        let canSetZone = node.category != "Router"
         let editRect = NSRect(x: rect.minX + 74 + rect.width * 0.36 - 30, y: rect.minY + 14, width: 26, height: 24)
         renameButtonRect = editRect
-        drawText(node.title, in: NSRect(x: rect.minX + 74, y: rect.minY + 15, width: rect.width * 0.36 - 36, height: 24), font: .systemFont(ofSize: 17, weight: .semibold), color: .labelColor)
+        zoneButtonRect = nil
+        drawText(node.title, in: NSRect(x: rect.minX + 74, y: rect.minY + 15, width: rect.width * 0.36 - (canSetZone ? 110 : 36), height: 24), font: .systemFont(ofSize: 17, weight: .semibold), color: .labelColor)
         drawPencilButton(in: editRect)
+        if canSetZone {
+            let zoneRect = NSRect(x: editRect.maxX + 8, y: rect.minY + 14, width: 66, height: 24)
+            zoneButtonRect = zoneRect
+            drawZoneButton(in: zoneRect, confirmed: node.isZoneConfirmed)
+        }
         drawText("\(node.category) - \(node.zone) - confidence \(node.confidence)%", in: NSRect(x: rect.minX + 74, y: rect.minY + 42, width: rect.width * 0.42, height: 18), font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
 
         let ipText = node.ip ?? "No IP observed"
@@ -2344,6 +2588,16 @@ final class DeviceLocationRadarView: NSView {
         drawText("✎", in: rect.insetBy(dx: 4, dy: 2), font: .systemFont(ofSize: 14, weight: .semibold), color: .controlAccentColor, alignment: .center)
     }
 
+    private func drawZoneButton(in rect: NSRect, confirmed: Bool) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+        (confirmed ? NSColor.systemGreen : NSColor.controlAccentColor).withAlphaComponent(0.14).setFill()
+        path.fill()
+        (confirmed ? NSColor.systemGreen : NSColor.controlAccentColor).withAlphaComponent(0.45).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+        drawText("Zone", in: rect.insetBy(dx: 6, dy: 3), font: .systemFont(ofSize: 12, weight: .semibold), color: confirmed ? .systemGreen : .controlAccentColor, alignment: .center)
+    }
+
     private func legendItems() -> [(title: String, icon: String, color: NSColor, alwaysShow: Bool)] {
         [
             ("Router", "📡", .systemBlue, true),
@@ -2385,7 +2639,7 @@ final class DeviceLocationRadarView: NSView {
 final class DeviceLocationWindowController: NSWindowController {
     private let radarView = DeviceLocationRadarView(frame: NSRect(x: 0, y: 0, width: 980, height: 700))
 
-    init(onRename: @escaping (DeviceLocationRadarNode) -> Void) {
+    init(onRename: @escaping (DeviceLocationRadarNode) -> Void, onSetZone: @escaping (DeviceLocationRadarNode) -> Void) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 980, height: 700),
             styleMask: [.titled, .closable, .resizable],
@@ -2399,6 +2653,7 @@ final class DeviceLocationWindowController: NSWindowController {
         window.center()
         radarView.autoresizingMask = [.width, .height]
         radarView.onRenameNode = onRename
+        radarView.onSetZoneNode = onSetZone
         window.contentView = radarView
         super.init(window: window)
     }
@@ -2431,10 +2686,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var devicesByID: [String: Device] = [:]
     private var devices: [Device] = []
+    private var devicePresenceStatuses: [String: DevicePresenceStatus] = [:]
     private var localInfo = LocalAddressInfo(interfaceName: nil, ip: nil, assignment: "Unknown")
     private var lastRefresh: Date?
-    private var hasCompletedInitialScan = false
-    private var newDeviceHighlights: [String: Date] = [:]
     private var isRefreshing = false
     private var timer: Timer?
     private var startupError: String?
@@ -2473,7 +2727,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
 
         let previousDevices = devicesByID
-        let previousIDs = Set(previousDevices.keys)
         let scanner = self.scanner
         let locationLayer = self.locationLayer
         let store = self.store
@@ -2506,26 +2759,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.finishRefresh(
                     devices: devices,
                     localInfo: localInfo,
-                    previousIDs: previousIDs,
                     now: now
                 )
             }
         }
     }
 
-    private func finishRefresh(devices refreshedDevices: [Device], localInfo refreshedLocalInfo: LocalAddressInfo, previousIDs: Set<String>, now: Date) {
+    private func finishRefresh(devices refreshedDevices: [Device], localInfo refreshedLocalInfo: LocalAddressInfo, now: Date) {
         localInfo = refreshedLocalInfo
         devices = refreshedDevices
-        if hasCompletedInitialScan {
-            for device in devices where !previousIDs.contains(device.id) {
-                newDeviceHighlights[device.id] = now
-            }
-        } else {
-            hasCompletedInitialScan = true
-        }
-
         devicesByID = Dictionary(uniqueKeysWithValues: devices.map { ($0.id, $0) })
-        pruneNewDeviceHighlights(now: now)
+        devicePresenceStatuses = store.updateNetworkPresence(with: devices, now: now)
         lastRefresh = now
         isRefreshing = false
         store.recordIdentities(from: locationLayer.radarNodes)
@@ -2542,11 +2786,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(title)
 
         let refreshed = lastRefresh.map { timeFormatter.string(from: $0) } ?? "Never"
-        let newCount = devices.filter { isNewDevice($0) }.count
-        let newSummary = newCount > 0 ? " - \(newCount) new" : ""
+        let newCount = devices.filter { presenceStatus(for: $0).isNewToNetwork }.count
+        let restartCount = devices.filter { presenceStatus(for: $0).isRestartMarked }.count
+        let statusParts = [
+            newCount > 0 ? "\(newCount) new" : nil,
+            restartCount > 0 ? "\(restartCount) restarted" : nil
+        ].compactMap { $0 }
+        let statusSummary = statusParts.isEmpty ? "" : " - \(statusParts.joined(separator: ", "))"
         let summaryTitle = isRefreshing
             ? "Looking up local network..."
-            : "\(devices.count) seen\(newSummary) - refreshed \(refreshed)"
+            : "\(devices.count) seen\(statusSummary) - refreshed \(refreshed)"
         let summary = NSMenuItem(title: summaryTitle, action: nil, keyEquivalent: "")
         summary.isEnabled = false
         menu.addItem(summary)
@@ -2664,20 +2913,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func menuItem(for device: Device) -> NSMenuItem {
         let label = displayName(for: device)
         let subtitle = store.state.showMacAddresses ? "\(device.ip) - \(device.mac)" : device.ip
-        let isNew = isNewDevice(device)
-        let newPrefix = isNew ? "NEW  " : ""
-        let item = NSMenuItem(title: "\(newPrefix)\(label)  \(subtitle)", action: nil, keyEquivalent: "")
+        let presence = presenceStatus(for: device)
+        let statusPrefix: String
+        if presence.isRestartMarked {
+            statusPrefix = "RESTART  "
+        } else if presence.isNewToNetwork {
+            statusPrefix = "NEW  "
+        } else {
+            statusPrefix = ""
+        }
+        let item = NSMenuItem(title: "\(statusPrefix)\(label)  \(subtitle)", action: nil, keyEquivalent: "")
         let submenu = NSMenu()
 
-        if isNew {
-            addDisabled("Status: New connection detected", to: submenu)
-        }
+        addDisabled("Status: \(presence.title)", to: submenu)
+        addDisabled(presence.detail, to: submenu)
         addDisabled("IP: \(device.ip)", to: submenu)
         addDisabled("Interface: \(device.interfaceName)", to: submenu)
         addDisabled("Address: \(device.addressStatus)", to: submenu)
         let guess = DeviceClassifier.classify(device: device, name: label)
         addDisabled("Guessed as: \(guess.summary)", to: submenu)
         addDisabled("MAC clue: \(guess.clue)", to: submenu)
+        addDisabled("Seen count: \(presence.seenCount)", to: submenu)
+        if let firstSeen = presence.firstSeen {
+            addDisabled("First seen on network: \(timeFormatter.string(from: firstSeen))", to: submenu)
+        }
         addDisabled("First seen: \(timeFormatter.string(from: device.firstSeen))", to: submenu)
         addDisabled("Last refreshed: \(timeFormatter.string(from: device.lastSeen))", to: submenu)
 
@@ -2766,16 +3025,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return "This Mac: \(ip) on \(interfaceName) - \(localInfo.assignment)"
     }
 
-    private func isNewDevice(_ device: Device) -> Bool {
-        newDeviceHighlights[device.id] != nil
-    }
-
-    private func pruneNewDeviceHighlights(now: Date) {
-        let visibleIDs = Set(devices.map(\.id))
-        let highlightDuration: TimeInterval = 5 * 60
-        newDeviceHighlights = newDeviceHighlights.filter { entry in
-            visibleIDs.contains(entry.key) && now.timeIntervalSince(entry.value) <= highlightDuration
-        }
+    private func presenceStatus(for device: Device) -> DevicePresenceStatus {
+        devicePresenceStatuses[device.id]
+            ?? store.presenceStatus(for: device.id, now: Date())
+            ?? DevicePresenceStatus(
+                title: "Learning network presence",
+                detail: "NetBar is still building a local baseline for this device.",
+                badge: nil,
+                firstSeen: nil,
+                seenCount: 0,
+                isNewToNetwork: false,
+                isRestartMarked: false,
+                isNormal: false
+            )
     }
 
     @objc private func toggleShowMacAddresses(_ sender: NSMenuItem) {
@@ -2831,7 +3093,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             localInfo: localInfo,
             gatewayIP: scanner.gatewayIPAddress(localInfo: localInfo),
             lastRefresh: lastRefresh,
-            newDeviceIDs: Set(newDeviceHighlights.keys)
+            presenceStatuses: devicePresenceStatuses
         )
     }
 
@@ -2852,6 +3114,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if deviceLocationWindowController == nil {
             deviceLocationWindowController = DeviceLocationWindowController(onRename: { [weak self] node in
                 self?.renameRadarDevice(node)
+            }, onSetZone: { [weak self] node in
+                self?.setRadarDeviceZone(node)
             })
         }
         updateDeviceLocationWindow()
@@ -2861,6 +3125,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showRecentChanges(_ sender: NSMenuItem) {
         var lines = locationLayer.recentChangeLines
+        let networkEvents = devices.compactMap { device -> String? in
+            let presence = presenceStatus(for: device)
+            if presence.isRestartMarked {
+                return "Restart marked: \(displayName(for: device)) (\(device.ip))"
+            }
+            if presence.isNewToNetwork {
+                return "New to network: \(displayName(for: device)) (\(device.ip))"
+            }
+            return nil
+        }
+        if !networkEvents.isEmpty {
+            lines.append("")
+            lines.append("Network baseline:")
+            lines.append(contentsOf: networkEvents)
+        }
         if !locationLayer.leftBehindAlerts.isEmpty {
             lines.append("")
             lines.append("Possible left-behind alerts:")
@@ -2913,6 +3192,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             deviceLocationWindowController?.renameNode(id: node.id, to: name.isEmpty ? node.title : name)
             rebuildMenu()
             updateNetworkMap()
+            refresh(nil)
+        }
+    }
+
+    private func setRadarDeviceZone(_ node: DeviceLocationRadarNode) {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let zones = ["Kitchen", "Bedroom", "Office", "Living Room", "Hallway", "Desk", "Clear Zone"]
+        let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 260, height: 28), pullsDown: false)
+        picker.addItems(withTitles: zones)
+        if node.isZoneConfirmed, let index = zones.firstIndex(where: { $0.caseInsensitiveCompare(node.zone) == .orderedSame }) {
+            picker.selectItem(at: index)
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Set zone for \(node.title)"
+        alert.informativeText = "This is a calibration hint. NetBar will move this device on the radar and use it as a stronger identity clue."
+        alert.accessoryView = picker
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            let selectedZone = picker.titleOfSelectedItem == "Clear Zone" ? nil : picker.titleOfSelectedItem
+            store.setZone(selectedZone, for: node)
+            rebuildMenu()
             refresh(nil)
         }
     }
