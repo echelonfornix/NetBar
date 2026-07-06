@@ -79,6 +79,7 @@ struct DevicePresenceRecord: Codable {
     var normalSince: Date?
     var restartMarkedUntil: Date?
     var restartNeedsConfirmation: Bool?
+    var noReplyAcknowledged: Bool?
     var isPresent: Bool
     var wasReachable: Bool?
 }
@@ -356,6 +357,7 @@ final class StateStore {
                 normalSince: nil,
                 restartMarkedUntil: nil,
                 restartNeedsConfirmation: nil,
+                noReplyAcknowledged: nil,
                 isPresent: false,
                 wasReachable: nil
             )
@@ -378,6 +380,7 @@ final class StateStore {
                 record.lastReachableAt = now
                 record.reachableMissCount = 0
                 record.wasReachable = true
+                record.noReplyAcknowledged = false
                 record.isPresent = true
             } else if hadReachableHistory {
                 record.lastUnreachableAt = now
@@ -440,6 +443,13 @@ final class StateStore {
         guard var record = state.networkPresence[deviceID] else { return }
         record.restartNeedsConfirmation = false
         record.restartMarkedUntil = nil
+        state.networkPresence[deviceID] = record
+        save()
+    }
+
+    func acknowledgeNoReply(for deviceID: String) {
+        guard var record = state.networkPresence[deviceID] else { return }
+        record.noReplyAcknowledged = true
         state.networkPresence[deviceID] = record
         save()
     }
@@ -628,7 +638,7 @@ final class StateStore {
             )
         }
 
-        if record.lastReachableAt != nil, record.wasReachable == false {
+        if record.lastReachableAt != nil, record.wasReachable == false, record.noReplyAcknowledged != true {
             return DevicePresenceStatus(
                 title: "Known device gave no reply",
                 detail: "It may be off, asleep, or blocking probes. If it answers again soon, NetBar will mark it as RESTART.",
@@ -3171,6 +3181,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             submenu.addItem(confirmRestart)
         }
 
+        if presence.isUnreachable {
+            let clearNoReply = NSMenuItem(title: "Clear No Reply Mark", action: #selector(clearNoReplyMark(_:)), keyEquivalent: "")
+            clearNoReply.target = self
+            clearNoReply.representedObject = device.id
+            submenu.addItem(clearNoReply)
+        }
+
         let clearName = NSMenuItem(title: "Clear Name", action: #selector(clearDeviceName(_:)), keyEquivalent: "")
         clearName.target = self
         clearName.representedObject = device.id
@@ -3562,6 +3579,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateNetworkMap()
             updateDeviceLocationWindow()
         }
+    }
+
+    @objc private func clearNoReplyMark(_ sender: NSMenuItem) {
+        guard let deviceID = sender.representedObject as? String else { return }
+        store.acknowledgeNoReply(for: deviceID)
+        devicePresenceStatuses[deviceID] = store.presenceStatus(for: deviceID, now: Date())
+        rebuildMenu()
+        updateNetworkMap()
+        updateDeviceLocationWindow()
     }
 
     @objc private func clearDeviceName(_ sender: NSMenuItem) {
