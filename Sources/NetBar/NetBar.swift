@@ -274,6 +274,57 @@ final class StateStore {
         save()
     }
 
+    func clearName(for device: Device) {
+        state.aliases.removeValue(forKey: device.id)
+
+        let mac = device.mac.lowercased()
+        let hostname = device.hostname?.lowercased()
+        var emptyProfileKeys: [String] = []
+
+        for key in state.identityProfiles.keys {
+            guard var profile = state.identityProfiles[key] else { continue }
+            profile.deviceIDs.removeAll { $0 == device.id }
+            profile.macs.removeAll { $0 == mac }
+            profile.lockedMacs.removeAll { $0 == mac }
+            profile.ips.removeAll { $0 == device.ip }
+            if let hostname {
+                profile.hostnames.removeAll { $0 == hostname }
+            }
+
+            if profile.deviceIDs.isEmpty,
+               profile.macs.isEmpty,
+               profile.ips.isEmpty,
+               profile.hostnames.isEmpty,
+               profile.lockedMacs.isEmpty {
+                emptyProfileKeys.append(key)
+            } else {
+                state.identityProfiles[key] = profile
+            }
+        }
+
+        for key in emptyProfileKeys {
+            state.identityProfiles.removeValue(forKey: key)
+        }
+
+        save()
+    }
+
+    func hasSavedName(for device: Device) -> Bool {
+        if state.aliases[device.id] != nil {
+            return true
+        }
+
+        let mac = device.mac.lowercased()
+        let hostname = device.hostname?.lowercased()
+        return state.identityProfiles.values.contains { profile in
+            profile.deviceIDs.contains(device.id)
+                || profile.macs.contains(mac)
+                || profile.lockedMacs.contains(mac)
+                || profile.ips.contains(device.ip)
+                || (hostname.map { profile.hostnames.contains($0) } ?? false)
+        }
+    }
+
     func identityContexts(for devices: [Device]) -> [String: DeviceIdentityContext] {
         Dictionary(uniqueKeysWithValues: devices.map { ($0.id, identityContext(for: $0)) })
     }
@@ -2954,7 +3005,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let clearName = NSMenuItem(title: "Clear Name", action: #selector(clearDeviceName(_:)), keyEquivalent: "")
         clearName.target = self
         clearName.representedObject = device.id
-        clearName.isEnabled = store.state.aliases[device.id] != nil
+        clearName.isEnabled = store.hasSavedName(for: device)
         submenu.addItem(clearName)
 
         submenu.addItem(.separator())
@@ -3254,8 +3305,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func clearDeviceName(_ sender: NSMenuItem) {
-        guard let deviceID = sender.representedObject as? String else { return }
-        store.setAlias(nil, for: deviceID)
+        guard let deviceID = sender.representedObject as? String,
+              let device = devicesByID[deviceID] else { return }
+        store.clearName(for: device)
+        updateNetworkMap()
+        updateDeviceLocationWindow()
         rebuildMenu()
     }
 

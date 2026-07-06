@@ -65,6 +65,8 @@ NetBar keeps a local network-baseline record in its state file. Devices with onl
 
 If a normally seen device disappears briefly and then comes back, NetBar marks it as `RESTART`. This is useful when you power-cycle a plug, console, speaker, TV, or other device: refresh NetBar, find the restart-marked item, then use `Rename...` while it is obvious what you just turned back on.
 
+Use `Clear Name` to remove the saved friendly name and the learned identity links for that device. NetBar may still show a real hostname if macOS reports one from the network.
+
 ## Local Network Lookup
 
 On refresh, NetBar briefly probes the private/local IPv4 subnet for this Mac's active LAN address. That network access helps macOS populate the ARP table, which makes the device list and Network Map more complete.
